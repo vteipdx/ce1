@@ -14,7 +14,7 @@ unit PhysicalMemory;
 interface
 
 uses
-  windows, jwawindows, sysutils, classes, registry;
+  windows, jwawindows, sysutils, classes;
 
 type
   TPhysicalMemoryDriver = record
@@ -27,7 +27,6 @@ type
 
   TWinNotifyKernelInfo = record
     KernelBase: QWORD;
-    PsInitialSystemProcess: QWORD;
   end;
 
   TPhysMemOps = class
@@ -344,7 +343,6 @@ begin
     if pidCheck = 4 then
     begin
       Result := sysProc;
-      FKernelInfo.PsInitialSystemProcess := sysProc;
       Exit;
     end;
   end;

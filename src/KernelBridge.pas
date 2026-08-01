@@ -13,7 +13,7 @@ interface
 
 uses
   windows, sysutils, classes,
-  SyscallGateway, AntiCheatDetector, PhysicalMemory, StealthHiding;
+  SyscallGateway, AntiCheatDetector, PhysicalMemory;
 
 type
   TKernelBridgeState = (
@@ -24,11 +24,9 @@ type
     kbsHypervisorDetected
   );
 
-  TKernelBridge = class
-  private
+  TKernelBridge = class  private
     FState: TKernelBridgeState;
     FACInfo: TAntiCheatInfo;
-    FKernelBase: QWORD;
   public
     constructor Create;
     destructor Destroy; override;
@@ -71,7 +69,6 @@ constructor TKernelBridge.Create;
 begin
   inherited;
   FState := kbsUnitialized;
-  FKernelBase := 0;
 end;
 
 destructor TKernelBridge.Destroy;
@@ -92,7 +89,7 @@ begin
   OutputDebugString('[KernelBridge] Initializing...');
 
   FACInfo := DetectAntiCheat;
-  OutputDebugString(PChar('[KernelBridge] Detected: ' + FACInfo.Name));
+  OutputDebugString(PChar('[KernelBridge] Detected: ' + GetAntiCheatName(FACInfo.AType)));
 
   if not ShouldUseKernelBridge(FACInfo.AType) then
   begin
@@ -116,29 +113,25 @@ begin
     Exit;
   end;
 
-  FKernelBase := PhysMem.GetKernelBase;
-  if FKernelBase = 0 then
+  if PhysMem.GetKernelBase = 0 then
   begin
     FState := kbsDriverFailed;
     OutputDebugString('[KernelBridge] Failed to resolve kernel base');
     Exit;
   end;
-  OutputDebugString(PChar('[KernelBridge] ntoskrnl base: 0x' + IntToHex(FKernelBase, 16)));
+  OutputDebugString(PChar('[KernelBridge] ntoskrnl base: 0x' + IntToHex(PhysMem.GetKernelBase, 16)));
 
   DisableObCallbacks;
 
   FState := kbsReady;
   Result := True;
   OutputDebugString('[KernelBridge] ACTIVE — kernel AC bypassed via WinNotify');
-
-  Stealth.HideAll;
 end;
 
 procedure TKernelBridge.Shutdown;
 begin
   if FState = kbsReady then
   begin
-    Stealth.UnhideAll;
     RestoreObCallbacks;
     PhysMem.Shutdown;
   end;
@@ -226,7 +219,7 @@ var
   entryCount: Integer;
 begin
   Result := False;
-  if FKernelBase = 0 then Exit;
+  if PhysMem.GetKernelBase = 0 then Exit;
   if not PhysMem.Initialized then Exit;
 
   OutputDebugString('[KernelBridge] Searching for ObCallbacks...');

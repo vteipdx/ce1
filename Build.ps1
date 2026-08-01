@@ -82,7 +82,7 @@ if ($Clean) {
 Write-Host "[...] Applying patches..." -ForegroundColor Yellow
 
 # Copy new units
-$newUnits = @("SyscallGateway.pas", "AntiCheatDetector.pas", "PhysicalMemory.pas", "KernelBridge.pas", "StealthHiding.pas")
+$newUnits = @("SyscallGateway.pas", "AntiCheatDetector.pas", "PhysicalMemory.pas", "KernelBridge.pas")
 foreach ($unit in $newUnits) {
     $src = Join-Path $SrcDir $unit
     $dst = Join-Path $CeProjectDir $unit
