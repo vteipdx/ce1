@@ -145,27 +145,8 @@ public class PEPatcher {
             }
         }
 
-        // 4. Rename PE sections
-        peOffset = dosHdr.e_lfanew;
-        IMAGE_FILE_HEADER fh2 = ByteToStruct<IMAGE_FILE_HEADER>(data, peOffset + 4);
-        int numSections = fh2.NumberOfSections;
-        int optHdrSz = fh2.SizeOfOptionalHeader;
-        int secStart = peOffset + 4 + 20 + optHdrSz;
-        string[] newNames = { ".c0d3", ".d4t4", ".r3f5", ".d4b6", ".t1s7", ".e4t8",
-                              ".p9g0", ".x1y2", ".z3w4", ".v5u6", ".m7n8", ".k9l0" };
-        int nameIdx = 0;
-        for (int s = 0; s < numSections; s++) {
-            IMAGE_SECTION_HEADER sh = ByteToStruct<IMAGE_SECTION_HEADER>(data, secStart + s * 40);
-            byte[] oldName = sh.Name;
-            string oldNameStr = System.Text.Encoding.ASCII.GetString(oldName).TrimEnd('\0');
-            byte[] newName = System.Text.Encoding.ASCII.GetBytes(newNames[nameIdx % newNames.Length]);
-            Array.Clear(sh.Name, 0, 8);
-            Array.Copy(newName, sh.Name, Math.Min(newName.Length, 8));
-            byte[] shBytes = StructToByte(sh);
-            Array.Copy(shBytes, 0, data, secStart + s * 40, shBytes.Length);
-            Console.WriteLine("[+] Section renamed: {0} -> {1}", oldNameStr.TrimEnd('\0'), newNames[nameIdx % newNames.Length]);
-            nameIdx++;
-        }
+        // 4. Keep standard section names (custom names are more suspicious)
+        // ponytail: stripping Rich Header + PDB is enough; non-standard names flag as packed malware
 
         File.WriteAllBytes(path, data);
         Console.WriteLine("[+] PE patching complete: {0}", path);

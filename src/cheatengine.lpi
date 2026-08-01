@@ -172,6 +172,7 @@
 -OpCOREAVX2
 -dbenchmarkps
 -dcemain
+-daltname
 -dNDEBUG
 -dDBVMFORAMDISWORKING
 -dNESTEDSTRUCTURES

@@ -52,15 +52,67 @@ function ShouldUseKernelBridge(AC: TAntiCheatType): Boolean;
 
 implementation
 
+uses
+  SyscallGateway;
+
+const
+  SystemModuleInformation = 11;  // SYSTEM_INFORMATION_CLASS
+
+type
+  TRTLProcessModuleInfo = packed record
+    Section: Pointer;
+    MappedBase: Pointer;
+    ImageBase: Pointer;
+    ImageSize: ULONG;
+    Flags: ULONG;
+    LoadOrderIndex: USHORT;
+    InitOrderIndex: USHORT;
+    LoadCount: USHORT;
+    OffsetToFileName: USHORT;
+    FullPathName: array[0..255] of Char;
+  end;
+
+  TRTLProcessModules = packed record
+    NumberOfModules: ULONG;
+    Modules: array[0..0] of TRTLProcessModuleInfo;
+  end;
+  PRTLProcessModules = ^TRTLProcessModules;
+
 function IsDriverLoaded(DriverName: string): Boolean;
 var
-  hDevice: THandle;
+  buf: Pointer;
+  bufSize: ULONG;
+  status: NTSTATUS;
+  retLen: ULONG;
+  pMods: PRTLProcessModules;
+  pMod: ^TRTLProcessModuleInfo;
+  modName: PChar;
+  i: Integer;
 begin
-  hDevice := CreateFile(PChar('\\.\' + DriverName),
-    GENERIC_READ or GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE,
-    nil, OPEN_EXISTING, 0, 0);
-  Result := (hDevice <> INVALID_HANDLE_VALUE);
-  if Result then CloseHandle(hDevice);
+  Result := False;
+  bufSize := 1024 * 1024; // 1MB buffer
+  GetMem(buf, bufSize);
+
+  status := SyscallNtQuerySystemInformation(SystemModuleInformation, buf, bufSize, @retLen);
+  if status < 0 then
+  begin
+    FreeMem(buf);
+    Exit;
+  end;
+
+  pMods := PRTLProcessModules(buf);
+  for i := 0 to pMods^.NumberOfModules - 1 do
+  begin
+    pMod := @pMods^.Modules[i];
+    modName := PChar(@pMod^.FullPathName[pMod^.OffsetToFileName]);
+    if SameText(modName, DriverName) then
+    begin
+      Result := True;
+      Break;
+    end;
+  end;
+
+  FreeMem(buf);
 end;
 
 function IsProcessRunning(ProcName: string): Boolean;

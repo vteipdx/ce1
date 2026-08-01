@@ -291,20 +291,27 @@ end;
 function TPhysMemOps.IOCTL_WritePhysicalWithCR3(CR3, VirtualAddr: QWORD;
   Buffer: Pointer; Size: DWORD): Boolean;
 var
-  inBuf: array[0..31] of Byte;
+  totalSize: DWORD;
+  pBuf: PByte;
   bytesReturned: DWORD;
 begin
   Result := False;
   if FDriver.hDevice = INVALID_HANDLE_VALUE then Exit;
+  if Size = 0 then Exit;
 
-  FillChar(inBuf, SizeOf(inBuf), 0);
-  PQWORD(@inBuf[0])^ := CR3;
-  PQWORD(@inBuf[8])^ := VirtualAddr;
-  PDWORD(@inBuf[16])^ := Size;
-  // Write data is part of the input
+  totalSize := 20 + Size; // header(20) + data(Size)
+  pBuf := GetMem(totalSize);
+  if pBuf = nil then Exit;
+
+  PQWORD(@pBuf[0])^ := CR3;
+  PQWORD(@pBuf[8])^ := VirtualAddr;
+  PDWORD(@pBuf[16])^ := Size;
+  Move(Buffer^, pBuf[20], Size);
 
   Result := DeviceIoControl(FDriver.hDevice, IOCTL_WINNOTIFY_PHYSWRITE,
-    @inBuf, SizeOf(inBuf), nil, 0, bytesReturned, nil);
+    pBuf, totalSize, nil, 0, bytesReturned, nil);
+
+  FreeMem(pBuf);
 end;
 
 // ---- Kernel structure navigation ----

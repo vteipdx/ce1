@@ -27,4 +27,9 @@ Desktop.ini
 
 # Sensitive
 RTCore64.sys
+WinNotify.sys
+signeddrv.sys
 *.sys
+
+# Reports (local only)
+report/

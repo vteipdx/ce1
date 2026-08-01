@@ -14,6 +14,9 @@ function SyscallWriteProcessMemory(hProcess: THandle; lpBaseAddress: Pointer; lp
 function SyscallVirtualQueryEx(hProcess: THandle; lpAddress: Pointer; var lpBuffer: TMemoryBasicInformation; dwLength: DWORD): DWORD; stdcall;
 function SyscallOpenProcess(dwDesiredAccess: DWORD; bInheritHandle: BOOL; dwProcessId: DWORD): THandle; stdcall;
 function SyscallCloseHandle(hObject: THandle): BOOL; stdcall;
+function SyscallNtQuerySystemInformation(SystemInformationClass: DWORD;
+  SystemInformation: Pointer; SystemInformationLength: ULONG;
+  ReturnLength: PULONG): NTSTATUS; stdcall;
 
 procedure InitSyscallNumbers;
 function AreSyscallsReady: Boolean;
@@ -26,6 +29,7 @@ var
   g_SyscallNtWriteVirtualMemory: WORD;
   g_SyscallNtQueryVirtualMemory: WORD;
   g_SyscallNtClose: WORD;
+  g_SyscallNtQuerySystemInformation: WORD;
   g_SyscallsReady: Boolean = False;
 
 type
@@ -57,6 +61,7 @@ type
     FileHeader: TImageFileHeader;
     OptionalHeader: TImageOptionalHeader64;
   end;
+  PImageNtHeaders = ^TImageNtHeaders;
 
   TSectionHeader = packed record
     Name: array[0..7] of Byte;
@@ -126,8 +131,8 @@ begin
 
   ExportDir := PImageExportDirectory(FileData + ExportDirFOA)^;
 
-  Names := PPDWORD(FileData + RvaToFileOffset(FileData, ExportDir.AddressOfNames));
-  Functions := PPDWORD(FileData + RvaToFileOffset(FileData, ExportDir.AddressOfFunctions));
+  Names := PDWORD(FileData + RvaToFileOffset(FileData, ExportDir.AddressOfNames));
+  Functions := PDWORD(FileData + RvaToFileOffset(FileData, ExportDir.AddressOfFunctions));
   Ordinals := PUSHORT(FileData + RvaToFileOffset(FileData, ExportDir.AddressOfNameOrdinals));
 
   for i := 0 to ExportDir.NumberOfNames - 1 do
@@ -196,6 +201,7 @@ begin
     g_SyscallNtWriteVirtualMemory := ExtractSyscallNumber(FileData, FileSize, 'NtWriteVirtualMemory');
     g_SyscallNtQueryVirtualMemory := ExtractSyscallNumber(FileData, FileSize, 'NtQueryVirtualMemory');
     g_SyscallNtClose := ExtractSyscallNumber(FileData, FileSize, 'NtClose');
+    g_SyscallNtQuerySystemInformation := ExtractSyscallNumber(FileData, FileSize, 'NtQuerySystemInformation');
 
     FreeMem(FileData);
   end;
@@ -211,6 +217,8 @@ begin
     g_SyscallNtQueryVirtualMemory := $23;
   if g_SyscallNtClose = 0 then
     g_SyscallNtClose := $0F;
+  if g_SyscallNtQuerySystemInformation = 0 then
+    g_SyscallNtQuerySystemInformation := $36;
 
   g_SyscallsReady := True;
 end;
@@ -256,16 +264,15 @@ begin
   clientId.UniqueProcess := dwPid;
 
   asm
+    lea rcx, [hProcess]
+    mov edx, dwAccess
+    lea r8, [objAttr]
+    lea r9, [clientId]
     mov r10, rcx
-    mov eax, g_SyscallNtOpenProcess
-    // Force stack-frame setup for CET compatibility
-    // ponytail: direct syscall from known code region; stack walks will show us
+    movzx eax, word [g_SyscallNtOpenProcess]
     syscall
-    mov hProcess, rax
   end;
 
-  // NTSTATUS to handle conversion: if NT_SUCCESS, handle = *Handle
-  // Actually NtOpenProcess returns HANDLE directly in newer impl, status in eax
   Result := hProcess;
 end;
 
@@ -279,7 +286,7 @@ begin
 
   asm
     mov r10, rcx
-    mov eax, g_SyscallNtReadVirtualMemory
+    movzx eax, word [g_SyscallNtReadVirtualMemory]
     syscall
     mov status, eax
   end;
@@ -297,7 +304,7 @@ begin
 
   asm
     mov r10, rcx
-    mov eax, g_SyscallNtWriteVirtualMemory
+    movzx eax, word [g_SyscallNtWriteVirtualMemory]
     syscall
     mov status, eax
   end;
@@ -310,14 +317,25 @@ function SyscallVirtualQueryEx(hProcess: THandle; lpAddress: Pointer;
 var
   status: NTSTATUS;
   ReturnLength: SIZE_T;
+  bufPtr: Pointer;
 begin
+  bufPtr := @lpBuffer;
   ReturnLength := 0;
   status := 0;
 
   asm
     mov r10, rcx
-    mov eax, g_SyscallNtQueryVirtualMemory
+    // rdx already = lpAddress (correct)
+    mov r8, 0              // MemoryBasicInformation
+    mov r9, bufPtr         // pointer to output buffer
+    // push 6th param: ReturnLength (optional, use NULL)
+    push 0
+    // 5th param: dwLength
+    push dwLength
+    sub rsp, $20           // shadow space for x64 syscall
+    movzx eax, word [g_SyscallNtQueryVirtualMemory]
     syscall
+    add rsp, $30           // 0x20 shadow + 0x10 two pushes
     mov status, eax
   end;
 
@@ -335,12 +353,28 @@ begin
 
   asm
     mov r10, rcx
-    mov eax, g_SyscallNtClose
+    movzx eax, word [g_SyscallNtClose]
     syscall
     mov status, eax
   end;
 
   Result := (status >= 0);
+end;
+
+function SyscallNtQuerySystemInformation(SystemInformationClass: DWORD;
+  SystemInformation: Pointer; SystemInformationLength: ULONG;
+  ReturnLength: PULONG): NTSTATUS; stdcall;
+var
+  status: NTSTATUS;
+begin
+  status := 0;
+  asm
+    mov r10, rcx
+    movzx eax, word [g_SyscallNtQuerySystemInformation]
+    syscall
+    mov status, eax
+  end;
+  Result := status;
 end;
 
 {$else cpu64}

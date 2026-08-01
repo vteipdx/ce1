@@ -183,7 +183,7 @@ end;
 function TKernelBridge.OpenProcessKernel(ProcessId: DWORD; AccessMask: DWORD): THandle;
 begin
   if FState = kbsReady then
-    Result := THandle(ProcessId) or THandle($CE000000)
+    Result := THandle(ProcessId) or THandle($FF000000)
   else
     Result := 0;
 end;
@@ -265,7 +265,7 @@ begin
     Exit;
   end;
 
-  pid := DWORD(hProcess) and $0FFFFFFF;
+  pid := DWORD(hProcess) and $00FFFFFF;
   bytesRead := 0;
   Result := KernelBr.ReadProcessMemoryKernel(pid, QWORD(lpBaseAddress),
     lpBuffer, nSize, bytesRead);
@@ -285,7 +285,7 @@ begin
     Exit;
   end;
 
-  pid := DWORD(hProcess) and $0FFFFFFF;
+  pid := DWORD(hProcess) and $00FFFFFF;
   bytesWritten := 0;
   Result := KernelBr.WriteProcessMemoryKernel(pid, QWORD(lpBaseAddress),
     lpBuffer, nSize, bytesWritten);
@@ -303,7 +303,7 @@ begin
     Exit;
   end;
 
-  pid := DWORD(hProcess) and $0FFFFFFF;
+  pid := DWORD(hProcess) and $00FFFFFF;
   Result := KernelBr.VirtualQueryExKernel(pid, QWORD(lpAddress), lpBuffer);
 end;
 

@@ -1995,7 +1995,7 @@ end;
 procedure DBKFileAsMemory(fn:string; baseaddress: ptruint=0); overload;
 begin
 {$if defined(windows) and not defined(STANDALONECH)}
-  filehandler.filename:=filename;
+  filehandler.filename:=fn;
   if filehandler.filedata<>nil then
     freeandnil(filehandler.filedata);
 
