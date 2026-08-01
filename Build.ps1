@@ -177,8 +177,8 @@ if ($exeToProcess -and (Test-Path $exeToProcess)) {
 Write-Host ""
 Write-Host "Tiers Loaded:" -ForegroundColor Cyan
 Write-Host "  [T1] User-mode evasion: obfuscation + syscall gateway" -ForegroundColor Gray
-Write-Host "  [T2] Kernel bridge BYOVD: physmem R/W + ObCallback bypass + process hiding" -ForegroundColor Gray
+Write-Host "  [T2] Kernel bridge: WinNotify.sys CR3 page table R/W + ObCallback bypass" -ForegroundColor Gray
 Write-Host "  [PE] Rich Header stripped + sections renamed + timestamp randomized" -ForegroundColor Gray
 Write-Host ""
-Write-Host "T2 Activation requires RTCore64.sys in system32\drivers\" -ForegroundColor Yellow
+Write-Host "T2 Activation requires WinNotify.sys / signeddrv.sys" -ForegroundColor Yellow
 Write-Host "[T3] DMA hardware: documented but NOT IMPLEMENTED (future research)" -ForegroundColor DarkGray

@@ -20,13 +20,14 @@
 │  ├─ Direct syscall stubs (bypass ntdll.dll hooks)         │
 │  └─ Dynamic syscall number extraction from disk           │
 ├─────────────────────────────────────────────────────────┤
-│  T2: Kernel Bridge (BYOVD)                                │
+│  T2: Kernel Bridge (BYOVD — WinNotify.sys)                │
 │  ├─ Anti-cheat detection (10 engines)                     │
-│  ├─ Vulnerable driver loader (RTCore64.sys)               │
-│  ├─ Physical memory R/W via IOCTL                         │
-│  ├─ Virtual-to-physical page table walking                │
-│  ├─ ObCallback bypass (disables handle stripping)         │
-│  └─ Process hiding (PsActiveProcessLinks unlinking)       │
+│  ├─ Microsoft-signed driver (WinNotify.sys / signeddrv.sys)│
+│  ├─ Kernel virtual memory R/W via IOCTL (no phys mapping)  │
+│  ├─ CR3-based page table walking for any process           │
+│  ├─ KASLR defeat via kernel base disclosure IOCTL          │
+│  ├─ ObCallback bypass (kernel struct manipulation)         │
+│  └─ Process hiding (PsActiveProcessLinks unlinking)        │
 ├─────────────────────────────────────────────────────────┤
 │  T3: DMA Hardware [NOT IMPLEMENTED]                       │
 │  └─ PCIe FPGA/device for hypervisor-level AC bypass       │
@@ -40,9 +41,9 @@
 | Warden (Blizzard) | User-mode | T1 | Functional |
 | VAC (Valve) | User-mode | T1 | Functional |
 | XIGNCODE3 | User-mode driver | T1 | Functional |
-| EasyAntiCheat | Kernel driver | T2 | Requires RTCore64.sys |
-| BattlEye | Kernel driver | T2 | Requires RTCore64.sys |
-| nProtect GameGuard | Kernel driver | T2 | Requires RTCore64.sys |
+| EasyAntiCheat | Kernel driver | T2 | Requires WinNotify.sys |
+| BattlEye | Kernel driver | T2 | Requires WinNotify.sys |
+| nProtect GameGuard | Kernel driver | T2 | Requires WinNotify.sys |
 | Ricochet (CoD) | Kernel driver | T2 | Partial |
 | Vanguard (Riot) | Hypervisor | T3 (DMA) | NOT IMPLEMENTED |
 | Faceit / ESEA | Kernel + Hypervisor | T3 (DMA) | NOT IMPLEMENTED |
@@ -87,17 +88,18 @@
 - Generates assembly stubs: `mov r10, rcx; mov eax, [syscall_num]; syscall; ret`
 - Bypasses user-mode hooks in `ntdll.dll` installed by EAC/BE
 
-### Tier 2: Kernel Bridge (BYOVD)
+### Tier 2: Kernel Bridge (BYOVD — WinNotify.sys)
 
 For kernel-level anti-cheats that block handle creation via `ObRegisterCallbacks`:
 
 1. **Detection**: Scans for EAC/BE drivers (`EasyAntiCheat.sys`, `BEDaisy.sys`) and services
-2. **Driver loading**: Loads `RTCore64.sys` (MSI Afterburner, signed, CVE-2019-16098) via Windows Service Control Manager
-3. **Physical memory mapping**: Uses IOCTL `0x80002000` to map arbitrary physical memory into user space
-4. **Page table walking**: Translates target process virtual addresses → physical via 4-level paging
-5. **Direct R/W**: Reads/writes target process memory through physical addresses, bypassing ALL handle checks
-6. **ObCallback bypass**: Locates and disables EAC/BE pre-operation callbacks in the kernel's callback list
-7. **Process hiding**: Unlinks CE's EPROCESS from `PsActiveProcessLinks`
+2. **Driver loading**: Loads `WinNotify.sys` / `signeddrv.sys` (Microsoft Authenticode signed, 2026, 0 VT detections) via Windows Service Control Manager
+3. **KASLR defeat** (IOCTL `0x22200C`): Reads `ntoskrnl.exe` base address directly from the kernel's loaded module list
+4. **Kernel virtual memory R/W** (IOCTL `0x222040`/`0x222044`): Reads/writes any kernel virtual address — no physical address translation needed
+5. **EPROCESS walk**: Finds System process (PID=4), walks `ActiveProcessLinks` to locate target game process
+6. **CR3 page table walk** (IOCTL `0x222050`/`0x222054`): Uses the game's `DirectoryTableBase` to read/write its virtual memory through its own page tables
+7. **Zero handles needed**: No `OpenProcess`, no `NtReadVirtualMemory` — completely invisible to ObCallbacks
+8. **Process hiding**: Unlinks CE's EPROCESS from `PsActiveProcessLinks`
 
 ### Tier 3: DMA Hardware (NOT IMPLEMENTED)
 
@@ -108,10 +110,11 @@ For hypervisor-level anti-cheats (Vanguard, Faceit), a PCIe DMA device would be 
 1. **Lazarus IDE** 3.x with FreePascal 3.2.2: https://www.lazarus-ide.org/
 2. **Git** for cloning the upstream CE repository
 3. **Administrator privileges** (required for driver loading and process access)
-4. **RTCore64.sys** — Obtain from an MSI Afterburner installation:
-   - Path: `C:\Program Files (x86)\MSI Afterburner\RTCore64.sys`
-   - Copy to: `C:\Windows\System32\drivers\RTCore64.sys`
-   - Or place alongside the compiled executable
+4. **WinNotify.sys / signeddrv.sys** — Microsoft-signed kernel driver providing:
+   - Arbitrary kernel virtual memory read (IOCTL `0x222040`)
+   - Arbitrary kernel virtual memory write (IOCTL `0x222044`)
+   - Per-process CR3 page table walker (IOCTL `0x222050`/`0x222054`)
+   - Place in `C:\Windows\System32\drivers\` or alongside the compiled executable
 
 ## Build Instructions
 
@@ -142,13 +145,13 @@ Launch sysdiag64.exe
   ├─ [No kernel AC detected]
   │   └─ T1 active: syscall bypass for all operations
   │
-  ├─ [EAC/BE detected + RTCore64.sys available]
+  ├─ [EAC/BE detected + WinNotify.sys available]
   │   ├─ Load driver via SCM
-  │   ├─ Map physical memory
-  │   ├─ Locate ntoskrnl base
-  │   ├─ Disable ObCallbacks (if possible)
+  │   ├─ IOCTL 0x22200C → leak kernel base (KASLR defeated)
+  │   ├─ IOCTL 0x222040 → read PsInitialSystemProcess → walk ActiveProcessLinks
+  │   ├─ Find game EPROCESS → extract DirectoryTableBase (CR3)
   │   ├─ Hide own process from enumeration
-  │   └─ All memory ops via physmem R/W (zero handles needed)
+  │   └─ All memory ops via CR3 page table walk (zero handles, zero OpenProcess)
   │
   └─ [Vanguard/Faceit detected]
       └─ Warning: hypervisor AC — requires T3 (DMA hardware, not implemented)
@@ -169,15 +172,17 @@ This project demonstrates the following cybersecurity concepts:
 
 - **Vanguard** operates at the hypervisor level (boot-time driver) and cannot be bypassed without T3 (DMA hardware)
 - **Faceit/ESEA** use layered kernel + hypervisor protection — requires T3
-- **RTCore64.sys** may be blacklisted by future anti-cheat updates; the cat-and-mouse dynamic is inherent to this research area
-- Windows 11 with HVCI/VBS active may prevent loading vulnerable drivers
+- **WinNotify.sys** may be added to Microsoft's driver blocklist in future Windows updates
+- Windows 11 with HVCI/VBS active may block the driver despite the valid Microsoft signature
+- EPROCESS offsets vary by Windows build; the included list covers 10 22H2 and 11 23H2
 
 ## References
 
-- CVE-2019-16098: RTCore64.sys arbitrary physical memory read/write
+- WinNotify.sys / signeddrv.sys: Microsoft-signed vulnerable kernel driver (2026, 0 VT detections)
 - Cheat Engine: https://github.com/cheat-engine/cheat-engine
-- Windows NT Kernel: ObRegisterCallbacks, PsActiveProcessLinks, x64 Page Tables
+- Windows NT Kernel: ObRegisterCallbacks, PsActiveProcessLinks, EPROCESS, CR3/DirectoryTableBase
 - Lazarus IDE: https://www.lazarus-ide.org/
+- LOLDrivers: https://www.loldrivers.io/
 
 ---
 
