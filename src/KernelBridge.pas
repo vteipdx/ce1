@@ -2,7 +2,7 @@ unit KernelBridge;
 
 {$mode objfpc}{$H+}
 
-{ Kernel Bridge for Cheat Engine Stealth Edition - T2
+{ Kernel Bridge for Cheat Engine Undetectable - T3
   Uses BYOVD physical memory access to bypass kernel-level anti-cheat protections.
   
   Academic research: demonstrates how signed driver vulnerabilities (CVE)

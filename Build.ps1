@@ -1,5 +1,5 @@
-# Build.ps1 - Cheat Engine Stealth Edition Build System
-# Clones upstream CE, applies stealth patches, builds, and post-processes
+# Build.ps1 - Cheat Engine Undetectable Build System
+# Clones upstream CE, applies patches, builds, and post-processes
 param(
     [switch]$Clean,
     [string]$LazarusPath = "",
@@ -14,7 +14,7 @@ $CeDir = Join-Path $RootDir "cheat-engine"
 $CeProjectDir = Join-Path $CeDir "Cheat Engine"
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " CE Stealth Edition - Build System" -ForegroundColor Cyan
+Write-Host " CE Undetectable - Build System" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Root:     $RootDir"
 Write-Host "Source:   $SrcDir"
@@ -78,8 +78,8 @@ if ($Clean) {
     Write-Host "[OK] Cleaned" -ForegroundColor Green
 }
 
-# --- Step 4: Apply stealth patches ---
-Write-Host "[...] Applying stealth patches..." -ForegroundColor Yellow
+# --- Step 4: Apply patches ---
+Write-Host "[...] Applying patches..." -ForegroundColor Yellow
 
 # Copy new units
 $newUnits = @("SyscallGateway.pas", "AntiCheatDetector.pas", "PhysicalMemory.pas", "KernelBridge.pas", "StealthHiding.pas")
@@ -175,7 +175,7 @@ if ($exeToProcess -and (Test-Path $exeToProcess)) {
     Write-Host "Size:   $([math]::Round($size, 1)) MB" -ForegroundColor White
 }
 Write-Host ""
-Write-Host "Stealth Tiers Loaded:" -ForegroundColor Cyan
+Write-Host "Tiers Loaded:" -ForegroundColor Cyan
 Write-Host "  [T1] Window/process/registry obfuscation (-daltname)" -ForegroundColor Gray
 Write-Host "  [T2] Direct syscall gateway (bypasses ntdll hooks)" -ForegroundColor Gray
 Write-Host "  [T3] Kernel bridge BYOVD (physmem + ObCallback bypass)" -ForegroundColor Gray

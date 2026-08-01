@@ -1,4 +1,4 @@
-# Cheat Engine Stealth Edition
+# Cheat Engine Undetectable
 
 **Academic Research Edition** — Modified Cheat Engine with multi-tiered anti-cheat evasion for cybersecurity education and university-level reverse engineering research.
 
@@ -64,8 +64,7 @@ Cheat Engine/
 │   └── StealthHiding.pas        # Process/module hiding via PEB unlinking
 │
 ├── Build Tools
-│   ├── Build-Stealth.ps1        # Automated build pipeline
-│   └── PEPatcher.ps1            # Post-build PE mutation
+│   ├── Build.ps1               # Automated build pipeline (root)
 │
 └── cheat-engine/                # Upstream CE source (git submodule or clone)
 ```
@@ -116,15 +115,14 @@ For kernel-level anti-cheats that block handle creation via `ObRegisterCallbacks
 ## Build Instructions
 
 ```powershell
-# Clone and enter project directory
-git clone --depth 1 https://github.com/cheat-engine/cheat-engine.git cheat-engine
-cd cheat-engine\Cheat Engine
-
-# Run the build script
-.\Build-Stealth.ps1 -Clean
+```
+git clone https://github.com/NulledNah/cheat-engine-undetectable.git
+cd cheat-engine-undetectable
+.\Build.ps1 -Clean
 
 # If Lazarus is not in C:\lazarus:
-.\Build-Stealth.ps1 -Clean -LazarusPath "D:\lazarus"
+.\Build.ps1 -Clean -LazarusPath "D:\lazarus"
+```
 ```
 
 The script:

@@ -2,7 +2,7 @@ unit StealthHiding;
 
 {$mode objfpc}{$H+}
 
-{ Process/Module/Thread hiding for CE Stealth Edition
+{ Process/Module/Thread hiding for CE Undetectable
   Uses kernel bridge physical memory access to unlink from kernel structures }
 
 interface
