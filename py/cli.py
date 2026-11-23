@@ -135,9 +135,9 @@ def cmd_freeze(dev, args):
 def cmd_selftest(dev, args):
     """Non-destructive checks only -- nothing here can bugcheck the machine.
 
-    Deliberately does NOT walk kernel structures: with this driver every
-    unvalidated address dereference is a potential BSOD, so the risky part is
-    split into `memory-test` (own process only) and the offset hunt in `info`.
+    Every address used here is either handed to us by the driver itself
+    (0x222010 / 0x222014) or discovered from our own process, so no kernel
+    pointer is ever guessed.
     """
     print(f"[1/5] driver       : {dev.driver_path or '(already loaded)'}")
     print(f"      device       : {dev.cfg['device_path']}")
@@ -146,30 +146,31 @@ def cmd_selftest(dev, args):
     try:
         base = dev.get_kernel_base()      # 0x22200C, no address dereference
     except WinNotifyError as exc:
-        print(f"[2/5] module-base IOCTL failed: {exc}")
-        try:
-            present, enabled = winnotify.privilege_state("SeDebugPrivilege")
-            print(f"      SeDebugPrivilege: present={present} enabled={enabled}")
-            if present and not enabled:
-                print("      -> internal ZwQuerySystemInformation returns an "
-                      "empty list; run `privcheck` or restart elevated")
-        except WinNotifyError:
-            pass
+        print(f"[2/5] module-base lookup failed: {exc}")
         raise
-    print(f"[2/5] ntoskrnl      : 0x{base:X}   (KASLR defeated, no address guessed)")
+    print(f"[2/5] ntoskrnl      : 0x{base:X}   "
+          f"({getattr(dev, 'kernel_base_source', 'IOCTL')}, no address guessed)")
 
-    pid = resolve_pid(args.pid) if args.pid else os.getpid()
-    cr3 = dev.get_process_cr3(pid)        # validated EPROCESS walk
-    if not cr3:
+    pid = resolve_pid(args.pid) if getattr(args, "pid", None) else os.getpid()
+    sysproc = dev.find_system_eprocess()
+    if not sysproc:
         raise WinNotifyError(
-            f"could not resolve CR3 for pid {pid}.  Nothing was probed, so the "
-            "machine is fine. Run `winnotify-cli.exe info` to see which "
-            "PsInitialSystemProcess offset matches your build, then put it "
-            "first in ps_initial_system_offsets")
+            "could not get the System EPROCESS. Both 0x222010 and the "
+            "PsInitialSystemProcess read failed, which means the driver did "
+            "not accept either request; nothing was probed, so the machine "
+            "is fine")
+    eproc = dev.find_process_eprocess(pid)
+    if not eproc:
+        raise WinNotifyError(
+            f"pid {pid}: no EPROCESS found. The ActiveProcessLinks walk "
+            f"started from the driver-verified System EPROCESS 0x{sysproc:X} "
+            "and stopped at an unmapped link, so nothing was guessed and "
+            "nothing crashed. Run `info` to see the offsets this build uses")
+    cr3 = dev.get_process_cr3(pid)
     print(f"[3/5] EPROCESS/CR3  : 0x{cr3:X}   (pid {pid}"
-          + (", this process)" if pid == os.getpid() else ")"))
+          + (", this process)" if pid == os.getpid() else ")")
+          + f"  EPROCESS 0x{eproc:X}")
 
-    # 4) safe *user-mode* address discovery + page-table read of it
     addresses = winnotify.self_addresses()
     if not addresses:
         raise WinNotifyError("could not determine any known-good user address")
@@ -178,29 +179,29 @@ def cmd_selftest(dev, args):
     print(f"[4/5] page-table R/W: read {head!r} at 0x{addr:X} ({label}) -- OK")
     if pid == os.getpid() and addr == winnotify.module_base_w(None) and head != b"MZ":
         raise WinNotifyError(
-            "self image base did not read back as MZ -- page-table IOCTL layout "
-            "is wrong for this driver build")
+            "self image base did not read back as MZ -- the 0x222000 copy "
+            "direction or struct layout is wrong for this driver build")
 
-    # 5) write-back test on memory we own (only for ourselves)
     if pid == os.getpid():
         marker = b"WINNOTIFY-SELFTEST"
         target = None
-        for label, candidate in addresses:
-            if label.startswith("fresh"):
+        for lbl, candidate in addresses:
+            if lbl.startswith("fresh"):
                 target = candidate
         if target:
             dev.write_memory(pid, target, marker)
             back = dev.read_memory(pid, target, len(marker))
             if back != marker:
-                raise WinNotifyError(f"write test mismatch: wrote {marker!r}, got {back!r}")
+                raise WinNotifyError(
+                    f"write test mismatch: wrote {marker!r}, got {back!r}")
             print(f"[5/5] write test   : wrote+verified {marker!r} at 0x{target:X}")
         else:
             print("[5/5] write test   : skipped (no scratch allocation)")
     else:
         print("[5/5] write test   : skipped (target is not this process; "
               "use `memory-test` to exercise writes safely)")
-    print("[OK] all safe checks passed -- driver, kernel base, EPROCESS walk and "
-          "page-table R/W work")
+    print("[OK] all safe checks passed -- driver, kernel base, EPROCESS lookup "
+          "and page-table R/W work")
 
 
 def cmd_memory_test(dev, args):
@@ -228,12 +229,7 @@ def cmd_memory_test(dev, args):
 
 
 def cmd_privcheck(dev, args):
-    """Pure Win32 diagnostics: no IOCTL is sent, nothing can crash.
-
-    The module-base IOCTL runs ZwQuerySystemInformation(SystemModuleInformation)
-    inside the driver, which only returns data when the caller's token has
-    SeDebugPrivilege ENABLED.  This shows the token state up front.
-    """
+    """Pure Win32 diagnostics: no IOCTL is sent, nothing can crash."""
     print("[i] no IOCTL is sent by this command -- it only inspects the token")
     elevated = _is_admin()
     print(f"[+] running as admin : {elevated}")
@@ -249,33 +245,17 @@ def cmd_privcheck(dev, args):
     except WinNotifyError as exc:
         print(f"[!] token query failed: {exc}")
     if not elevated:
-        print("[!] not elevated -- SeDebugPrivilege is absent from a UAC-filtered "
-              "token; run `winnotify-cli.exe` without --no-elevate to get the "
-              "UAC prompt, or start it from an Administrator prompt")
+        print("[!] not elevated -- an Administrator token that UAC filtered has "
+              "no SeLoadDriverPrivilege, so the driver service cannot be "
+              "created. Run without --no-elevate to get the UAC prompt, or "
+              "start the tool from an Administrator prompt")
     for name in ("SeDebugPrivilege", "SeLoadDriverPrivilege"):
         try:
             present, enabled = winnotify.privilege_state(name)
         except WinNotifyError as exc:
             print(f"[-] {name}: {exc}")
             continue
-        print(f"[+] {name:22s} present={present!s:5s} enabled={enabled}")
-        if present and not enabled:
-            try:
-                enable_privilege(name)
-                present, enabled = winnotify.privilege_state(name)
-                print(f"    -> enabled now: {enabled}")
-            except WinNotifyError as exc:
-                print(f"    -> could not enable: {exc}")
-    print("[i] 0x22200C answers 0 if SeDebugPrivilege is not enabled at call time")
-
-
-def _is_admin():
-    try:
-        shell32 = ctypes.WinDLL("shell32")
-        shell32.IsUserAnAdmin.restype = wintypes.BOOL
-        return bool(shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+        print(f"[+] {name:22s} present={present} enabled={enabled}")
 
 
 def cmd_info(dev, args):
@@ -288,28 +268,37 @@ def cmd_info(dev, args):
     print(f"[+] py           : {sys.version.split()[0]} "
           f"({8 * ctypes.sizeof(ctypes.c_void_p)}-bit)")
     base = dev.kernel_base
-    print(f"[+] ntoskrnl     : 0x{base:X}")
-    offsets = dev.cfg["ps_initial_system_offsets"]
-    preferred = dev.cfg.get("preferred_ps_offset")
-    if preferred is not None:
-        offsets = [preferred] + [o for o in offsets if o != preferred]
-    print(f"[+] probing PsInitialSystemProcess candidates "
-          f"(read-only, structural checks, no writes):")
-    for off in offsets[: args.max_offsets]:
-        try:
-            ptr = dev.read_qword(base + off)
-        except WinNotifyError as exc:
-            print(f"      +0x{off:06X}: read failed: {exc}")
-            continue
-        if not dev._is_kernel_ptr(ptr):
-            print(f"      +0x{off:06X}: 0x{ptr:X}   (not a kernel pointer)")
-            continue
-        pid = dev.read_qword(ptr + dev.cfg["eprocess_pid"])
-        sys_ok = pid == 4 and dev._looks_like_eprocess(ptr, dev.cfg["eprocess_pid"])
-        print(f"      +0x{off:06X}: -> 0x{ptr:X} pid={pid}"
-              + ("   <== matches (System)" if sys_ok else ""))
-    print("[i] set preferred_ps_offset (or reorder ps_initial_system_offsets) "
-          "in winnotify.json to the matching value")
+    print(f"[+] ntoskrnl     : 0x{base:X} "
+          f"({getattr(dev, 'kernel_base_source', 'IOCTL')})")
+
+    print("[+] driver-discovered addresses (no guessing):")
+    sysproc = dev.find_system_eprocess()
+    print(f"      System EPROCESS    : "
+          + (f"0x{sysproc:X}" if sysproc else "(0x222010 not implemented)"))
+    mypid = os.getpid()
+    ib = dev.image_base_via_driver(mypid)
+    print(f"      own image base     : "
+          + (f"0x{ib:X} (0x222014)" if ib else "(0x222014 not implemented)"))
+    if sysproc:
+        print("[+] walking ActiveProcessLinks (validated at every hop):")
+        pid_off = dev.cfg["eprocess_pid"]
+        links = dev.cfg["eprocess_links"]
+        cur = sysproc
+        for i in range(args.max_offsets):
+            try:
+                flink = dev.read_qword(cur + links)
+                pid = dev.read_qword(cur + pid_off)
+                dtb = dev.read_qword(cur + dev.cfg["eprocess_dtb"])
+            except WinNotifyError as exc:
+                print(f"      {i}: 0x{cur:X} read stopped: {exc}")
+                break
+            print(f"      {i}: 0x{cur:X}  pid={pid}  DirBase=0x{dtb & 0xFFFFFFFFFF000:X}")
+            if not dev._is_kernel_ptr(flink) or flink - links == sysproc:
+                print("      (end of list)")
+                break
+            cur = flink - links
+    print("[i] 0x222000/0x222004 take the PID; the driver reads EPROCESS+0x28 "
+          "for the DirBase itself, so no CR3 is ever passed in.")
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +390,8 @@ def main(argv=None):
         print("[ERROR] this build must run on Windows")
         return 1
 
-    # A UAC-filtered token has no SeDebugPrivilege at all, and the driver's
-    # 0x22200C needs it.  Restart elevated instead of failing with "0".
+    # Loading the driver service needs SeLoadDriverPrivilege, which a
+    # UAC-filtered Administrator token does not carry.  Restart elevated.
     if not args.no_elevate and not os.environ.get("WINNOTIFY_ELEVATED_CHILD"):
         try:
             summary = winnotify.token_summary()
@@ -410,7 +399,7 @@ def main(argv=None):
             summary = {}
         if summary and not summary.get("elevated", True):
             print(f"[!] not elevated (integrity={summary.get('integrity', '?')}, "
-                  "UAC-filtered token: SeDebugPrivilege is absent)")
+                  "UAC-filtered token: no SeLoadDriverPrivilege)")
             print("[i] relaunching with administrator rights (UAC prompt)...")
             try:
                 return winnotify.relaunch_elevated(sys.argv[1:])

@@ -1,10 +1,12 @@
 {
-  "_comment": "copy to winnotify.json next to the exe. 0x-strings become ints. Win10 21H2 (19044): preferred_ps_offset 0xCFC420. Never set info_name_is_pointer=false: the driver dereferences +0x00.",
+  "_comment": "copy to winnotify.json next to the exe. 0x-strings become ints. Every length below was read off the signed.sys dispatcher. 0x222000/0x222004 take the PID in +0x00 (NOT a CR3) and need +0x20 non-zero. Never set info_name_is_pointer=false: the driver dereferences +0x00.",
   "ioctl_info": "0x22200C",
   "ioctl_read": "0x222040",
   "ioctl_write": "0x222044",
   "ioctl_vread": "0x222000",
   "ioctl_vwrite": "0x222004",
+  "ioctl_process": "0x222010",
+  "ioctl_eprocess": "0x222014",
   "device_path": "\\\\.\\WinNotify",
   "service_name": "WinNotify",
   "driver_search": [
@@ -17,6 +19,7 @@
     "ntoskrnl.exe",
     "ntoskrnl"
   ],
+  "info_name_is_pointer": true,
   "info_in_size": "0x18",
   "info_out_size": "0x20",
   "info_result_offset": "0x10",
@@ -29,40 +32,22 @@
   "write_out_size": 0,
   "vioctl_size": "0x28",
   "vioctl_layout": 0,
-  "vioctl_probe_sizes": [
-    "0x28",
-    "0x20"
-  ],
-  "info_probe_sizes": [
-    "0x18",
-    "0x28"
-  ],
-  "info_probe_out_sizes": [
-    "0x20",
-    "0x40"
-  ],
-  "read_probe_sizes": [
-    "0x38",
-    "0x40"
-  ],
-  "read_probe_biases": [
-    "0x10",
-    0
-  ],
-  "write_probe_sizes": [
-    "0x18",
-    "0x28"
-  ],
-  "autodetect": true,
-  "use_direct_vioctl": true,
-  "phys_page_size": "0x1000",
-  "eprocess_links": "0x448",
+  "vioctl_pid_field": true,
+  "vioctl_use_eprocess_cr3": true,
   "eprocess_pid": "0x440",
-  "eprocess_dtb": "0x28",
-  "eprocess_probe_shifts": [
-    "0x10",
-    0
+  "eprocess_pid_candidates": [
+    "0x450",
+    "0x438",
+    "0x440"
   ],
+  "eprocess_links": "0x448",
+  "eprocess_dtb": "0x28",
+  "eprocess_scan_bytes": "0x200",
+  "eprocess_pool_scan": false,
+  "eprocess_pool_start": "0xFFFF800000000000",
+  "eprocess_pool_end": "0xFFFFC00000000000",
+  "eprocess_pool_step": "0x1000",
+  "eprocess_pool_max_pages": 4096,
   "ps_initial_system_offsets": [
     "0xCFC420",
     "0xD0A420",
@@ -70,18 +55,24 @@
     "0xD8C420",
     "0xCFC3E0"
   ],
+  "preferred_ps_offset": "0xCFC420",
+  "probe_ps_offsets": false,
+  "probe_eprocess_shifts": false,
+  "eprocess_probe_shifts": [
+    "0x10",
+    0
+  ],
   "cr3_mask": "0x000FFFFFFFFFF000",
-  "keep_service": true,
+  "phys_page_size": "0x1000",
   "vioctl_chunk": "0x1000",
   "max_process_iter": 2000,
-  "probe_ps_offsets": false,
-  "preferred_ps_offset": "0xCFC420",
-  "probe_eprocess_shifts": false,
-  "allow_unknown_ioctl": true,
-  "info_name_is_pointer": true,
-  "vet_ioctl_packets": true,
-  "ensure_debug_privilege": true,
-  "fallback_kernel_base": true,
+  "keep_service": true,
   "force_unload": false,
-  "kernel_base_via_system_info": true
+  "vet_ioctl_packets": true,
+  "allow_unknown_ioctl": true,
+  "use_direct_vioctl": true,
+  "autodetect": true,
+  "kernel_base_via_system_info": true,
+  "fallback_kernel_base": true,
+  "ensure_debug_privilege": false
 }

@@ -143,30 +143,73 @@ dev.stop()
 > 想测别的进程用 `winnotify-cli.exe selftest --pid 1234`
 > 或 `... selftest --pid PlantsVsZombies.exe`。
 
-## 3.1 驱动 ABI(已验证)
+## 3.1 驱动 ABI(逐条反汇编核对过)
 
-第一次跑 `selftest` 报 `DeviceIoControl(0x22200C) WinError 24`(= ERROR_BAD_LENGTH),
-原因是 Pascal 版传的输入长度不对 —— **该驱动对每个 IOCTL 校验精确输入长度**。
-按公开逆向结论(signeddrv.sys / WinNotify.sys):
+之前几版都是"照着别人的逆向文章猜结构",所以一直对不上。这次把
+`Haider303/winnotify-exp` 里的 **signed.sys 本体**反汇编,逐条指令读出
+真实的 dispatcher,结论如下(每一项都能在二进制里指到具体指令):
 
 | IOCTL | 输入长度 | 结构 | 输出 |
 |---|---|---|---|
-| `0x22200C` 取模块基址 | `0x18` | `[+0] 指向 "ntoskrnl.exe" 的**用户指针**(不是字节!)` | `+0x10 = base`(共 0x20) |
-| `0x222040` 内核读 | `0x38` | `[+0] base`, `[+8] offset` | `+0x10..0x30` 5 个 QWORD,仅当 `*(base+0x10)!=0` 才回写 |
-| `0x222044` 内核写 | `0x18` | `[+0] src`, `[+8] size`, `[+10] dst` | `memmove(dst, src, size)` |
-| `0x222000` 虚拟读 | `0x28` | `[+0] flags(0)`, `[+8] va`, `[+10] buf`, `[+18] size`, `[+20] CR3` | 数据写进 `buf` |
+| `0x22200C` 取模块基址 | `0x18` | `[+0] 指向 "ntoskrnl.exe" 的**用户指针**(不是字节!)` | `+0x10 = base` |
+| `0x222040` 内核读 | `0x38` | `[+0] base`, `[+8] offset` | `+0x10..0x30` 共 5 个 QWORD,仅当 `*(base+offset+0x10)!=0` 才回写 |
+| `0x222044` 内核写 | `0x18` | `[+0] src`, `[+8] size`, `[+0x10] dst` | `memmove(dst, src, size)` |
+| `0x222000` 虚拟读 | `0x28` | `[+0] **PID**`, `[+8] va`, `[+0x10] buf`, `[+0x18] size`, `[+0x20] 必须非 0` | 数据写进 `buf` |
 | `0x222004` 虚拟写 | `0x28` | 同上 | 从 `buf` 写进目标进程 |
+| `0x222010` 取 System EPROCESS | `8` | 无 | `+0x00` = SYSTEM 进程的 EPROCESS |
+| `0x222014` 取进程映象基址 | `0x18` | `[+0] pid`, `[+0x10] size≠0` | `+0x08` = 该进程的映像基址 |
 
-因此:
+### 之前为什么会一直失败
 
-* `0x222000/0x222004` 成为**主路径**:把目标进程 CR3 交给驱动翻页表,
-  不再自己逐页读物理内存,也不依赖 `0x222050/0x222054`;
-* `0x222040/0x222044` 用于 EPROCESS 遍历,并作为回退路径(`"use_direct_vioctl": false`);
-* 所有长度/偏移都可覆盖,且默认**自动探测**:INFO 先试 `0x18` 再试 `0x28`,
-  READ 试 `0x38/0x40` 与 bias `0x10/0`,虚拟读写试 `0x28` 与
-  `[cr3][va][size][buf]` 旧布局;命中后打印 `[i] ... auto-detected` 并记住。
+1. **`0x222000/0x222004` 的第 1 个字段是 PID,不是 CR3。**
+   驱动拿到 PID 后自己 `PsLookupProcessByProcessId` 再读
+   `EPROCESS+0x28` 作为 DirBase。我此前一直往里传 CR3,
+   而 `[+0x20]` 被驱动当成"必须非 0"的哨兵位 —— 上一版往那里塞的
+   恰好是 CR3,看着能用,但 `[+0]` 的 PID 是 0,于是每条请求都被
+   驱动以 `0xC0000022` 直接拒掉。这条路从一开始就没通过。
+2. **`0x22200C` 里没有任何权限检查。**
+   它就是调 `ZwQuerySystemInformation(0xb)`,返回 0 表示"模块列表里
+   没匹配到"。前几版把它归因于 SeDebugPrivilege,并让程序去重开令牌,
+   既没解决问题,又把进程的权限/完整性改坏了(现在默认不再动令牌)。
+3. **`0x222040` 的结果在 `out+0x20`,不是 `out+0x10`。**
+   驱动读的是 `base+offset`、`+0x10`、`+0x20` 三个位置,只有
+   `buffer[2]`(即 `+(offset+0x10)`)非 0 才把 5 个 QWORD 回写到
+   `out+0x10..0x38`。所以请求要用 `base = addr-0x10`、`offset = 0`,
+   答案再去 `out+0x20` 取 —— 这样即使目标值是 0 也能读对。
+
+### 现在的调用链(全部经过实测模拟)
+
+```
+内核基址   NtQuerySystemInformation(11) 用户态直接拿(不需要 IOCTL、不需要特权)
+System EP  0x222010 → 驱动自己 PsLookupProcessByProcessId(4)
+目标 EP    从 System EP 沿 ActiveProcessLinks 走,每一跳校验后才用;
+           命中后用 0x222014 的映像基址交叉确认
+进程读写   0x222000 / 0x222004,只传 PID + 用户态地址 + 我们自己的缓冲区
+```
+
+`0x222040` 只在读 EPROCESS 字段时使用,并且有两条硬约束:
+窗口 `[addr-0x10, addr+0x18]` 不能跨页;地址必须是规范内核地址。
 
 ## 3.2 修改记录
+
+* **v8 (2026-11-23)**: **按 `signed.sys` 本体反汇编重写 IOCTL 层**。
+  拿你给的那个仓库里的 `signed.sys`(sha256 `4dc3a03a…508e0f`)
+  逐条指令核对,发现三个致命 bug:
+  1. `0x222000/0x222004` 的 `[+0]` 是 **PID**,`[+0x20]` 是**必须非 0 的哨兵**,
+     不是 CR3 —— 之前每条虚拟读写请求都被驱动以 `0xC0000022` 拒掉;
+  2. `0x222040` 的返回值在 `out+0x20`(驱动写的是
+     `out+0x10 = *(base+offset)`、`out+0x20 = *(base+offset+0x10)`),
+     之前从 `out+0x10` 取,读出来的永远是"目标地址前 0x10 字节";
+  3. `0x22200C` **没有任何权限检查**,之前关于 SeDebugPrivilege 的整条
+     推断是错的(`ensure_debug_privilege` 默认改为 **false**,不再重开令牌)。
+  同时新增两条**不需要猜地址**的路径:
+  * `0x222010` 直接拿 System EPROCESS(驱动内部 `PsLookupProcessByProcessId(4)`);
+  * `0x222014` 拿任意进程的映像基址,用来交叉确认 EPROCESS 命中。
+  因此 `PsInitialSystemProcess` 偏移(`0xCFC420` 那套)**不再是必需项**,
+  EPROCESS 也不再靠"扫一片内存找 pid"来猜。
+* **另修一个隐藏 bug**:`winnotify.py` 里 `class WinNotify` 被整段重复了
+  一次(早期替换脚本写坏的),后一份覆盖前一份,所以某些改动一直"没生效"。
+  已删除重复段(文件从 3016 行降到约 1950 行)。
 
 * **v7 (2026-11-23)**: **修复"令牌里根本没有 SeDebugPrivilege"**。
   之前 `token_privileges()` 解析 `TOKEN_PRIVILEGES` 时把数组起点写成 `+8`,
