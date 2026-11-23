@@ -82,5 +82,6 @@
   "vet_ioctl_packets": true,
   "ensure_debug_privilege": true,
   "fallback_kernel_base": true,
-  "force_unload": false
+  "force_unload": false,
+  "kernel_base_via_system_info": true
 }

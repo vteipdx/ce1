@@ -237,9 +237,21 @@ def cmd_privcheck(dev, args):
     print("[i] no IOCTL is sent by this command -- it only inspects the token")
     elevated = _is_admin()
     print(f"[+] running as admin : {elevated}")
+    try:
+        summary = winnotify.token_summary()
+        print(f"[+] elevated token   : {summary.get('elevated')}")
+        print(f"[+] integrity level  : {summary.get('integrity', '?')}"
+              f" (rid 0x{summary.get('integrity_rid', 0):X})")
+        print(f"[+] elevation type   : {summary.get('elevation_type')} "
+              "(3 = default/UAC-filtered, 2 = full)")
+        privs = summary.get("privileges", {})
+        print(f"[+] privileges held  : {len(privs)}")
+    except WinNotifyError as exc:
+        print(f"[!] token query failed: {exc}")
     if not elevated:
-        print("[!] not elevated -- SeDebugPrivilege/SeLoadDriverPrivilege are "
-              "usually unavailable; re-run from an Administrator prompt")
+        print("[!] not elevated -- SeDebugPrivilege is absent from a UAC-filtered "
+              "token; run `winnotify-cli.exe` without --no-elevate to get the "
+              "UAC prompt, or start it from an Administrator prompt")
     for name in ("SeDebugPrivilege", "SeLoadDriverPrivilege"):
         try:
             present, enabled = winnotify.privilege_state(name)
@@ -321,6 +333,8 @@ def build_parser():
     parser.add_argument("--driver", default=None)
     parser.add_argument("--unload", action="store_true")
     parser.add_argument("--json", default=None)
+    parser.add_argument("--no-elevate", action="store_true", default=False,
+                        help="never try to relaunch as administrator")
     sub = parser.add_subparsers(dest="cmd")
 
     def target_addr(sp):
@@ -386,6 +400,28 @@ def main(argv=None):
     if not winnotify.IS_WINDOWS:
         print("[ERROR] this build must run on Windows")
         return 1
+
+    # A UAC-filtered token has no SeDebugPrivilege at all, and the driver's
+    # 0x22200C needs it.  Restart elevated instead of failing with "0".
+    if not args.no_elevate and not os.environ.get("WINNOTIFY_ELEVATED_CHILD"):
+        try:
+            summary = winnotify.token_summary()
+        except WinNotifyError:
+            summary = {}
+        if summary and not summary.get("elevated", True):
+            print(f"[!] not elevated (integrity={summary.get('integrity', '?')}, "
+                  "UAC-filtered token: SeDebugPrivilege is absent)")
+            print("[i] relaunching with administrator rights (UAC prompt)...")
+            try:
+                return winnotify.relaunch_elevated(sys.argv[1:])
+            except WinNotifyError as exc:
+                print(f"[!] could not self-elevate: {exc}")
+                print("[i] close this window and start it from an "
+                      "Administrator PowerShell, or pass --no-elevate")
+                return 1
+        elif summary:
+            print(f"[i] token: elevated={summary.get('elevated')} "
+                  f"integrity={summary.get('integrity', '?')}")
 
     exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     dev = None

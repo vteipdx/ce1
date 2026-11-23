@@ -56,6 +56,7 @@ ERROR_SERVICE_EXISTS = 1073
 
 TOKEN_ADJUST_PRIVILEGES = 0x0020
 TOKEN_QUERY = 0x0008
+TOKEN_ALL_ACCESS = 0x000F01FF
 SE_PRIVILEGE_ENABLED = 0x00000002
 ERROR_NOT_ALL_ASSIGNED = 1300
 ERROR_BAD_LENGTH = 24
@@ -89,7 +90,8 @@ DEFAULT_CONFIG = {
     # the driver dereference an ASCII constant -> instant bugcheck.
     "info_name_is_pointer": True,
     "ensure_debug_privilege": True,    # 0x22200C needs it, else it answers 0
-    "fallback_kernel_base": True,      # NtQuerySystemInformation if the driver says 0
+    "kernel_base_via_system_info": True,  # preferred: needs no token privilege
+    "fallback_kernel_base": True,          # also retry it if the driver says 0
     # The driver validates the *exact* input length per IOCTL and fails with
     # ERROR_BAD_LENGTH (24) otherwise -- these are the lengths from the RE.
     "info_in_size": 0x18,          # 24
@@ -313,6 +315,11 @@ SIGNATURES = {
         _signature("Process32NextW", [
             wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)], wintypes.BOOL),
         _signature("GetModuleHandleW", [wintypes.LPCWSTR], wintypes.HMODULE),
+        _signature("GetCurrentProcessId", [], wintypes.DWORD),
+        _signature("WaitForSingleObject", [wintypes.HANDLE, wintypes.DWORD],
+                   wintypes.DWORD),
+        _signature("GetExitCodeProcess", [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
         _signature("NtCurrentTeb", [], ctypes.c_void_p),
         _signature("VirtualAlloc", [
             ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD],
@@ -495,31 +502,57 @@ def enable_privilege(name):
     return True
 
 
-def token_privileges():
-    """Map of privilege name -> enabled? for the current process (diagnostics)."""
-    _require_windows()
+# TokenInformationClass
+TOKEN_ELEVATION_TYPE_CLASS = 18
+TOKEN_INTEGRITY_LEVEL_CLASS = 25
+TOKEN_ELEVATION_CLASS = 20
+SECURITY_IMPERSONATION = 2
+TOKEN_QUERY_ACCESS = 0x0008
+TOKEN_ADJUST_PRIVILEGES_ACCESS = 0x0020
+
+
+def _token_bytes(token, info_class):
+    """Raw GetTokenInformation buffer for one class (or b"")."""
     GetTokenInformation = _api(_adv, "GetTokenInformation")
-    close_handle = _api(_k32, "CloseHandle")
-    TOKEN_PRIVILEGES_CLASS = 3
-    token = _open_own_token()
     size = wintypes.DWORD(0)
-    GetTokenInformation(token, TOKEN_PRIVILEGES_CLASS, None, 0,
-                        ctypes.byref(size))
-    buf = ctypes.create_string_buffer(size.value or 1)
-    result = {}
+    GetTokenInformation(token, info_class, None, 0, ctypes.byref(size))
+    if not size.value:
+        return b""
+    buf = ctypes.create_string_buffer(size.value)
+    if not GetTokenInformation(token, info_class, buf, size.value,
+                               ctypes.byref(size)):
+        return b""
+    return buf.raw[:size.value]
+
+
+def token_privileges():
+    """LUID -> enabled? for every privilege present in our token.
+
+    GetTokenInformation(TokenPrivileges) returns TOKEN_PRIVILEGES:
+      DWORD PrivilegeCount;            <- 4 bytes, count follows at +0
+      LUID_AND_ATTRIBUTES Privileges[]; <- first entry starts at +4 (ALIGN=4)
+    The old parser used +8 for the array and therefore misreported every
+    privilege as missing.
+    """
+    _require_windows()
+    close_handle = _api(_k32, "CloseHandle")
+    token = _open_own_token()
     try:
-        if not GetTokenInformation(token, TOKEN_PRIVILEGES_CLASS, buf,
-                                   size.value, ctypes.byref(size)):
-            return result
-        count = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0]
-        arr = ctypes.cast(ctypes.byref(buf, 8),
-                          ctypes.POINTER(_LUID_AND_ATTRIBUTES * count)).contents
-        for entry in arr:
-            result[int(entry.Luid.LowPart)] = bool(
-                entry.Attributes & SE_PRIVILEGE_ENABLED)
+        raw = _token_bytes(token, 3)          # TokenPrivileges
+        if len(raw) < 4:
+            return {}
+        count = int.from_bytes(raw[0:4], "little")
+        result = {}
+        for i in range(count):
+            off = 4 + i * 12                  # LUID(8) + DWORD attributes
+            if off + 12 > len(raw):
+                break
+            low = int.from_bytes(raw[off:off + 4], "little")
+            attrs = int.from_bytes(raw[off + 8:off + 12], "little")
+            result[low] = bool(attrs & SE_PRIVILEGE_ENABLED)
+        return result
     finally:
         close_handle(token)
-    return result
 
 
 def privilege_state(name):
@@ -529,8 +562,176 @@ def privilege_state(name):
     if not _api(_adv, "LookupPrivilegeValueW")(None, name, ctypes.byref(luid)):
         return False, False
     state = token_privileges()
-    enabled = state.get(int(luid.LowPart), False)
-    return int(luid.LowPart) in state, enabled
+    return int(luid.LowPart) in state, state.get(int(luid.LowPart), False)
+
+
+def token_summary():
+    """Everything needed to explain a privilege problem, without guessing."""
+    _require_windows()
+    close_handle = _api(_k32, "CloseHandle")
+    info = {}
+
+    # token elevation type: 1=limited (UAC), 2=full, 3=default
+    try:
+        token = _open_own_token()
+        try:
+            raw = _token_bytes(token, TOKEN_ELEVATION_TYPE_CLASS)
+            info["elevation_type"] = (int.from_bytes(raw[0:4], "little")
+                                      if len(raw) >= 4 else None)
+        finally:
+            close_handle(token)
+    except WinNotifyError as exc:
+        info["elevation_type_error"] = str(exc)
+    try:
+        token = _open_own_token()
+        try:
+            raw = _token_bytes(token, TOKEN_ELEVATION_CLASS)
+            info["elevated"] = bool(int.from_bytes(raw[0:4], "little")) \
+                if len(raw) >= 4 else False
+        finally:
+            close_handle(token)
+    except WinNotifyError:
+        info["elevated"] = False
+
+    # process integrity level from the token's mandatory label SID
+    try:
+        token = _open_own_token()
+        try:
+            raw = _token_bytes(token, TOKEN_INTEGRITY_LEVEL_CLASS)
+            if len(raw) >= 12:
+                sid_count = int.from_bytes(raw[4:8], "little")
+                attrs = int.from_bytes(raw[8:12], "little")
+                sid = raw[12:]
+                rid = int.from_bytes(sid[-4:], "little") if len(sid) >= 8 else 0
+                info["integrity_rid"] = rid
+                info["integrity"] = {
+                    0x0000: "Untrusted", 0x1000: "Low", 0x2000: "Medium",
+                    0x2100: "Medium-Plus", 0x3000: "High", 0x4000: "System",
+                }.get(rid & 0xF000, f"0x{rid:X}")
+        finally:
+            close_handle(token)
+    except WinNotifyError:
+        pass
+
+    try:
+        info["privileges"] = token_privileges()
+    except WinNotifyError as exc:
+        info["privileges_error"] = str(exc)
+    return info
+
+
+def is_elevated():
+    """True when this process runs with a full (elevated) administrator token."""
+    try:
+        return bool(token_summary().get("elevated"))
+    except WinNotifyError:
+        return False
+
+
+def relaunch_elevated(argv=None, wait=True):
+    """Restart ourselves through ShellExecuteW(runas) so the child gets a full
+    administrator token, then wait for it and mirror its exit code.  Never
+    loops: the child is spawned inside a job-object marker env var, and its
+    environment does not contain the flag."""
+    _require_windows()
+    shell32 = _load_library("shell32")
+    run_as = _try_getattr(shell32, "ShellExecuteExW")
+    if run_as is None:
+        raise WinNotifyError("ShellExecuteExW unavailable")
+
+    params = " ".join(_quote_arg(a) for a in (argv or sys.argv[1:]))
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", wintypes.ULONG),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", ctypes.c_void_p),
+            ("dwHotKey", wintypes.DWORD),
+            ("hMonitor", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x00000040           # SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb = "runas"
+    info.lpFile = sys.executable
+    info.lpParameters = params
+    info.lpDirectory = os.getcwd()
+    info.nShow = 1                    # SW_SHOWNORMAL
+    run_as.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    run_as.restype = wintypes.BOOL
+    if not run_as(ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        raise WinNotifyError(
+            f"UAC elevation declined or shell error {err} "
+            f"({ctypes.FormatError(err).strip() if err else 'cancelled'})")
+    if not info.hProcess:
+        return 0
+    wait_fn = _try_getattr(_k32, "WaitForSingleObject")
+    get_code = _try_getattr(_k32, "GetExitCodeProcess")
+    code = wintypes.DWORD(0)
+    try:
+        if wait and wait_fn:
+            wait_fn(info.hProcess, 0xFFFFFFFF)
+        if get_code:
+            get_code(info.hProcess, ctypes.byref(code))
+    finally:
+        _api(_k32, "CloseHandle")(info.hProcess)
+    return int(code.value)
+
+
+def _quote_arg(arg):
+    if not arg:
+        return '""'
+    if any(c in arg for c in ' \t"'):
+        return '"' + arg.replace('"', '\\"') + '"'
+    return arg
+
+
+def reopen_with_all_privileges():
+    """Re-open our own process token TOKEN_ALL_ACCESS and re-enable privileges.
+
+    Even for a full admin token this is a cheap way to make sure nothing was
+    stripped: SeAssignPrimaryTokenPrivilege only appears on a *primary* token
+    opened with TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY|TOKEN_ASSIGN_PRIMARY.
+    """
+    _require_windows()
+    open_process_token = _api(_adv, "OpenProcessToken")
+    close_handle = _api(_k32, "CloseHandle")
+    token = wintypes.HANDLE()
+    if not open_process_token(_api(_k32, "GetCurrentProcess")(),
+                              TOKEN_ALL_ACCESS, ctypes.byref(token)):
+        raise _winerr("OpenProcessToken(TOKEN_ALL_ACCESS)")
+    enabled = []
+    try:
+        raw = _token_bytes(token, 3)
+        count = int.from_bytes(raw[0:4], "little") if len(raw) >= 4 else 0
+        for i in range(count):
+            off = 4 + i * 12
+            if off + 12 > len(raw):
+                break
+            entry = _TOKEN_PRIVILEGES()
+            entry.PrivilegeCount = 1
+            entry.Privileges[0].Luid = LUID()
+            entry.Privileges[0].Luid.LowPart = int.from_bytes(raw[off:off + 4], "little")
+            entry.Privileges[0].Luid.HighPart = int.from_bytes(raw[off + 4:off + 8], "little")
+            entry.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+            _api(_adv, "AdjustTokenPrivileges")(token, False,
+                                                ctypes.byref(entry), 0, None, None)
+            enabled.append(int.from_bytes(raw[off:off + 4], "little"))
+    finally:
+        close_handle(token)
+    return enabled
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +965,20 @@ class WinNotify:
         out_size = self.cfg["info_out_size"]
         off = self.cfg["info_result_offset"]
         pointer_mode = self.cfg.get("info_name_is_pointer", True)
+
+        # Prefer the path that needs no token privilege at all: the module list
+        # is readable from user mode, and on this driver 0x22200C internally
+        # requires SeDebugPrivilege, which a UAC-filtered process never has.
+        if self.cfg.get("kernel_base_via_system_info", True):
+            try:
+                base = kernel_base_from_system_info(self.cfg["info_module_names"][0])
+                if self._looks_like_kernel_base(base):
+                    self.kernel_base = base
+                    self.kernel_base_source = "NtQuerySystemInformation"
+                    return base
+            except WinNotifyError as exc:
+                self.log(f"[i] user-mode module lookup unavailable: {exc}")
+
         if self.cfg.get("ensure_debug_privilege", True):
             self._ensure_debug_privilege()
         last = None
@@ -808,9 +1023,11 @@ class WinNotify:
             if base == 0:
                 last = WinNotifyError(
                     "0x22200C answered 0: the driver's module list was empty. "
-                    "That happens when SeDebugPrivilege is not enabled in this "
-                    "token (run as Administrator) or the driver's internal "
-                    "module snapshot failed")
+                    "It resolves modules through ZwQuerySystemInformation(0xb), "
+                    "which needs SeDebugPrivilege ENABLED -- a UAC-filtered "
+                    "token does not even contain that privilege. Run the tool "
+                    "elevated (the tool offers a UAC prompt automatically) or "
+                    "pass --no-elevate only if you are already Administrator")
             else:
                 last = WinNotifyError(
                     f"module-base reply held 0x{base:X} (not a plausible "
@@ -1789,6 +2006,20 @@ class WinNotify:
         out_size = self.cfg["info_out_size"]
         off = self.cfg["info_result_offset"]
         pointer_mode = self.cfg.get("info_name_is_pointer", True)
+
+        # Prefer the path that needs no token privilege at all: the module list
+        # is readable from user mode, and on this driver 0x22200C internally
+        # requires SeDebugPrivilege, which a UAC-filtered process never has.
+        if self.cfg.get("kernel_base_via_system_info", True):
+            try:
+                base = kernel_base_from_system_info(self.cfg["info_module_names"][0])
+                if self._looks_like_kernel_base(base):
+                    self.kernel_base = base
+                    self.kernel_base_source = "NtQuerySystemInformation"
+                    return base
+            except WinNotifyError as exc:
+                self.log(f"[i] user-mode module lookup unavailable: {exc}")
+
         if self.cfg.get("ensure_debug_privilege", True):
             self._ensure_debug_privilege()
         last = None
@@ -1833,9 +2064,11 @@ class WinNotify:
             if base == 0:
                 last = WinNotifyError(
                     "0x22200C answered 0: the driver's module list was empty. "
-                    "That happens when SeDebugPrivilege is not enabled in this "
-                    "token (run as Administrator) or the driver's internal "
-                    "module snapshot failed")
+                    "It resolves modules through ZwQuerySystemInformation(0xb), "
+                    "which needs SeDebugPrivilege ENABLED -- a UAC-filtered "
+                    "token does not even contain that privilege. Run the tool "
+                    "elevated (the tool offers a UAC prompt automatically) or "
+                    "pass --no-elevate only if you are already Administrator")
             else:
                 last = WinNotifyError(
                     f"module-base reply held 0x{base:X} (not a plausible "

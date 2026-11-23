@@ -77,6 +77,7 @@ winnotify-cli.exe selftest
 
 :: 权限诊断(不发任何 IOCTL,纯用户态)
 winnotify-cli.exe privcheck
+:: 若当前不是管理员,工具会自己弹 UAC 以管理员重启;不想重启就用 --no-elevate
 
 :: 安全的自读自写测试(只动自己进程的 4 KB 新内存,不会蓝屏)
 winnotify-cli.exe memory-test
@@ -132,7 +133,8 @@ dev.stop()
 | `info_name_is_pointer` | `0x22200C` 的 `+0x00` 放用户态指针(**绝对不要关**) | `true` |
 | `vet_ioctl_packets` | 发送前校验每个 IOCTL 里的指针 | `true` |
 | `ensure_debug_privilege` | 调 `0x22200C` 前确保 SeDebugPrivilege 已启用 | `true` |
-| `fallback_kernel_base` | 驱动返回 0 时用 `NtQuerySystemInformation` 取内核基址 | `true` |
+| `kernel_base_via_system_info` | **优先**用用户态模块列表取内核基址(不需要令牌特权) | `true` |
+| `fallback_kernel_base` | 驱动返回 0 时再试一次用户态模块列表 | `true` |
 | `force_unload` | 允许 `--unload` 停止刚启动的驱动(可能蓝屏,默认拒绝) | `false` |
 
 `selftest` 会逐段报告哪一步失败,对应改哪个字段。
@@ -166,6 +168,16 @@ dev.stop()
 
 ## 3.2 修改记录
 
+* **v7 (2026-11-23)**: **修复"令牌里根本没有 SeDebugPrivilege"**。
+  之前 `token_privileges()` 解析 `TOKEN_PRIVILEGES` 时把数组起点写成 `+8`,
+  实际应为 `+4`(`DWORD PrivilegeCount` 后紧跟 `LUID_AND_ATTRIBUTES`),
+  所以把所有权限都误报成"不存在"。修好解析后:
+  * 优先用 **不需要任何令牌特权** 的 `NtQuerySystemInformation` 取内核基址
+    (`kernel_base_via_system_info`, 默认开),不再依赖 `0x22200C`;
+  * 检测到非提升令牌(中完整性)时**自动弹 UAC 重新以管理员启动**
+    (`relaunch_elevated`, `ShellExecuteExW runas`),`--no-elevate` 可关闭;
+  * `privcheck` 现在会打印 elevation type / 完整性级别 / 权限数量;
+  * 错误信息直接指向"用管理员运行"。
 * **v6 (2026-11-23)**: **修复 `0x22200C` 返回 0**。
   驱动内部走 `ZwQuerySystemInformation(SystemModuleInformation)`(信息类 0xb),
   这个类只有在调用方令牌的 **SeDebugPrivilege 处于启用状态**时才会返回模块列表,
