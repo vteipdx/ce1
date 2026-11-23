@@ -1012,15 +1012,19 @@ class WinNotify:
 
         # Prefer the user-mode module list: it needs neither the driver nor any
         # token privilege, so it works even when 0x22200C has nothing to say.
+        user_mode_error = None
         if self.cfg.get("kernel_base_via_system_info", True):
             try:
                 base = kernel_base_from_system_info(self.cfg["info_module_names"][0])
-                if self._looks_like_kernel_base(base):
-                    self.kernel_base = base
-                    self.kernel_base_source = "NtQuerySystemInformation"
-                    return base
+                self.kernel_base = base
+                self.kernel_base_source = "NtQuerySystemInformation"
+                return base
             except WinNotifyError as exc:
-                self.log(f"[i] user-mode module list unavailable: {exc}")
+                user_mode_error = exc
+                self.log(f"[i] user-mode module lookup: {exc}")
+            except (OSError, AttributeError, ValueError) as exc:
+                user_mode_error = WinNotifyError(f"{type(exc).__name__}: {exc}")
+                self.log(f"[i] user-mode module lookup: {user_mode_error}")
 
         if self.cfg.get("ensure_debug_privilege", False):
             self._ensure_debug_privilege()
@@ -1087,7 +1091,11 @@ class WinNotify:
             except WinNotifyError as exc:
                 self.log(f"[!] user-mode module lookup failed too: {exc}")
         if last:
-            raise WinNotifyError(f"{last}  [module-base IOCTL layout mismatch?]")
+            detail = f"{last}"
+            if user_mode_error is not None:
+                detail += (f" -- and the user-mode module list also failed "
+                           f"({user_mode_error})")
+            raise WinNotifyError(detail)
         raise WinNotifyError("driver returned no kernel base")
 
     def _ensure_debug_privilege(self):
@@ -1112,8 +1120,16 @@ class WinNotify:
         return enabled
 
     def _looks_like_kernel_base(self, value):
-        """ntoskrnl is 2 MB aligned and lives in the high half."""
-        return (value >> 48) == 0xFFFF and (value & 0x1FFFFF) == 0
+        """A canonical, page-aligned kernel address.
+
+        This used to demand 2 MB alignment.  That is not a property of the
+        kernel image: ntoskrnl is commonly mapped 4 KB aligned
+        (e.g. 0xFFFFF80461E13000), so the strict version rejected the one
+        correct answer and pushed the tool back onto a broken IOCTL.
+        """
+        return ((value >> 48) == 0xFFFF
+                and value >= 0xFFFF800000000000
+                and (value & 0xFFF) == 0)
 
     def _info_pointer_call(self, name, in_size, out_size):
         """Send 0x22200C with a pointer to a NUL-terminated name in our memory."""
@@ -1529,7 +1545,17 @@ class WinNotify:
                      "(0x222010 lookup, no offset guess)")
             return direct
         if not self.kernel_base:
-            self.get_kernel_base()
+            # Only the PsInitialSystemProcess fallback needs a kernel base.
+            # Reading kernel_base+offset with kernel_base == 0 would be a
+            # user-mode address, and the driver would dereference it.
+            try:
+                self.get_kernel_base()
+            except WinNotifyError as exc:
+                self.log(f"[i] no kernel base for the PsInitialSystemProcess "
+                         f"fallback: {exc}")
+                return 0
+            if not self.kernel_base:
+                return 0
         for pid_off, links_off, dtb_off in self._eprocess_layouts():
             for off in self._ps_offsets():
                 ptr = self.read_qword(self.kernel_base + off)
@@ -1920,8 +1946,18 @@ class WinNotify:
                     time.sleep(0.1)
             if last:
                 raise last
-        self.get_kernel_base()
-        self.log(f"[+] ntoskrnl base: 0x{self.kernel_base:X}")
+        try:
+            self.get_kernel_base()
+            self.log(f"[+] ntoskrnl base: 0x{self.kernel_base:X} "
+                     f"({getattr(self, 'kernel_base_source', 'IOCTL')})")
+        except WinNotifyError as exc:
+            # Not fatal: 0x222010/0x222014 hand us every address we need, and
+            # 0x222000/0x222004 take a PID rather than any kernel address.
+            # Only the PsInitialSystemProcess fallback needs the base.
+            self.kernel_base_error = exc
+            self.log(f"[!] kernel base unavailable: {exc}")
+            self.log("[i] continuing -- EPROCESS lookup goes through the "
+                     "driver (0x222010) and needs no kernel base")
         return self
 
     def stop(self, unload=None):
@@ -2015,8 +2051,28 @@ def self_addresses():
 # ---------------------------------------------------------------------------
 # Kernel base without the driver (fallback for "0x22200C answered 0")
 # ---------------------------------------------------------------------------
+# _RTL_PROCESS_MODULE_INFORMATION, read straight off the driver's own walk
+# (signed.sys sub_16d8):
+#     movzx ecx, word ptr [rdx+0x26]   ; OffsetToFileName
+#     mov   rbx, qword ptr [rdx+0x10]  ; ImageBase
+#     add   rdx, 0x128                 ; per-entry stride
+# so: 0x00 Section, 0x08 MappedBase, 0x10 ImageBase, 0x18 ImageSize,
+#     0x20 Flags, 0x24 LoadOrderIndex, 0x26 OffsetToFileName,
+#     0x28 FullImageName[256] -> sizeof = 0x128.
+MODULE_INFO_ENTRY_SIZE = 0x128
+MODULE_INFO_IMAGE_BASE = 0x10
+MODULE_INFO_NAME_OFFSET = 0x26
+MODULE_INFO_NAME = 0x28
+
+
 def _system_module_information():
-    """NtQuerySystemInformation(SystemModuleInformation) from user mode."""
+    """NtQuerySystemInformation(SystemModuleInformation) from user mode.
+
+    Returns [(full_path, image_base), ...].  Parsed with the exact layout the
+    driver itself uses, and every field is checked: a layout mistake used to
+    produce plausible-looking garbage that was silently discarded, which is
+    much worse than an exception.
+    """
     _require_windows()
     ntdll = _load_library("ntdll")
     query = _try_getattr(ntdll, "NtQuerySystemInformation")
@@ -2028,35 +2084,90 @@ def _system_module_information():
     size = wintypes.ULONG(0)
     query(11, None, 0, ctypes.byref(size))          # 11 = SystemModuleInformation
     if not size.value:
-        raise WinNotifyError("module information is empty")
+        raise WinNotifyError("NtQuerySystemInformation reported size 0")
     buf = ctypes.create_string_buffer(size.value)
     status = query(11, buf, size.value, ctypes.byref(size))
     if status < 0:
-        raise WinNotifyError(f"NtQuerySystemInformation failed: 0x{status & 0xFFFFFFFF:X}")
-    count = ctypes.cast(buf, ctypes.POINTER(wintypes.ULONG))[0]
-    entry_size = 0x130
-    base = ctypes.addressof(buf) + 8
+        raise WinNotifyError(
+            f"NtQuerySystemInformation(11) failed: 0x{status & 0xFFFFFFFF:X}")
+    total = ctypes.addressof(buf) + size.value
+    count = int.from_bytes(ctypes.string_at(ctypes.addressof(buf), 4), "little")
+    if not 0 < count < 0x2000:
+        raise WinNotifyError(
+            f"module count {count} is implausible -- layout mismatch")
+    entries = ctypes.addressof(buf) + 8
+    if entries + count * MODULE_INFO_ENTRY_SIZE > total:
+        raise WinNotifyError(
+            f"{count} entries x 0x{MODULE_INFO_ENTRY_SIZE:X} do not fit in "
+            f"the {size.value}-byte buffer -- layout mismatch")
     modules = []
     for i in range(count):
-        off = base + i * entry_size
-        if off + entry_size > ctypes.addressof(buf) + size.value:
-            break
-        raw = ctypes.string_at(off, entry_size)
-        dll_base = int.from_bytes(raw[0:8], "little")
-        name_bytes = raw[0x28:entry_size].split(b"\x00", 1)[0]
-        modules.append((name_bytes.decode("latin-1"), dll_base))
+        off = entries + i * MODULE_INFO_ENTRY_SIZE
+        raw = ctypes.string_at(off, MODULE_INFO_ENTRY_SIZE)
+        image_base = int.from_bytes(
+            raw[MODULE_INFO_IMAGE_BASE:MODULE_INFO_IMAGE_BASE + 8], "little")
+        name_off = int.from_bytes(
+            raw[MODULE_INFO_NAME_OFFSET:MODULE_INFO_NAME_OFFSET + 2], "little")
+        if not 0 < name_off < 0x100:
+            name_off = 0
+        image_size = int.from_bytes(raw[0x18:0x20], "little")
+        path = raw[MODULE_INFO_NAME + name_off:
+                   MODULE_INFO_NAME + 0x100].split(b"\x00", 1)[0]
+        modules.append((path.decode("latin-1"), image_base, image_size))
+    if not modules:
+        raise WinNotifyError("module list came back empty")
     return modules
 
 
 def kernel_base_from_system_info(name="ntoskrnl.exe"):
-    """Same answer as the driver's 0x22200C, obtained without it."""
+    """Same answer as the driver's 0x22200C, but obtained without it.
+
+    Validation is by self-consistency, never by an alignment guess.  A 2 MB
+    alignment check looked reasonable but is simply false on machines where
+    ntoskrnl loads 4 KB aligned (e.g. 0xFFFFF80461E13000), and rejecting a
+    correct value is what kept sending the tool back to the broken IOCTL.
+
+    Checks:
+      * the entry sits in the canonical kernel half
+      * it is page aligned
+      * ImageSize is a plausible kernel image size
+      * its path ends in the module we asked for
+    """
     wanted = name.lower()
-    for module, base in _system_module_information():
-        short = module.replace("\\??\\", "").replace("\\SystemRoot\\", "")
-        short = short.split("\\")[-1].lower()
-        if short == wanted:
-            return base
-    raise WinNotifyError(f"{name} not found in the module list")
+    if not wanted.endswith(".exe"):
+        wanted += ".exe"
+    modules = _system_module_information()
+    entry = None
+    for path, base, image_size in modules:
+        bare = path.replace("/", "\\").lower()
+        if bare.endswith("\\" + wanted):
+            entry = (path, base, image_size)
+            break
+    if entry is None:
+        for path, base, image_size in modules:
+            if wanted[:-4] in path.lower():
+                entry = (path, base, image_size)
+                break
+    if entry is None:
+        sample = ", ".join(p.replace("/", "\\").split("\\")[-1]
+                           for p, _, _ in modules[:6])
+        raise WinNotifyError(
+            f"{name} is not in the {len(modules)}-entry module list "
+            f"(first entries: {sample})")
+    path, base, image_size = entry
+    if (base >> 48) != 0xFFFF or base < 0xFFFF800000000000:
+        raise WinNotifyError(
+            f"module list gave 0x{base:X} for {name}, which is not a kernel "
+            "address -- _RTL_PROCESS_MODULE_INFORMATION layout mismatch")
+    if base & 0xFFF:
+        raise WinNotifyError(
+            f"module list gave 0x{base:X} for {name}, which is not page "
+            "aligned -- _RTL_PROCESS_MODULE_INFORMATION layout mismatch")
+    if not 0x10000 <= image_size <= 0x8000000:
+        raise WinNotifyError(
+            f"module list gave ImageSize 0x{image_size:X} for {name} -- "
+            "layout mismatch")
+    return base
 
 
 # ---------------------------------------------------------------------------

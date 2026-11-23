@@ -143,22 +143,28 @@ def cmd_selftest(dev, args):
     print(f"      device       : {dev.cfg['device_path']}")
     print(f"      service      : {dev.service_name}")
 
-    try:
-        base = dev.get_kernel_base()      # 0x22200C, no address dereference
-    except WinNotifyError as exc:
-        print(f"[2/5] module-base lookup failed: {exc}")
-        raise
-    print(f"[2/5] ntoskrnl      : 0x{base:X}   "
-          f"({getattr(dev, 'kernel_base_source', 'IOCTL')}, no address guessed)")
+    # 2) kernel base -- informational only.  Nothing below needs it: the
+    # driver resolves the System EPROCESS (0x222010), the image base
+    # (0x222014) and the DirBase itself, and 0x222000/0x222004 take a PID.
+    base = dev.kernel_base or getattr(dev, "kernel_base", 0)
+    if base:
+        print(f"[2/5] ntoskrnl      : 0x{base:X}   "
+              f"({getattr(dev, 'kernel_base_source', 'IOCTL')}, no address guessed)")
+    else:
+        err = getattr(dev, "kernel_base_error", None)
+        print(f"[2/5] ntoskrnl      : not needed for this path"
+              + (f"  ({err})" if err else ""))
+        print("      EPROCESS lookup uses 0x222010; process R/W uses "
+              "0x222000/0x222004 with the PID, so no kernel base is required")
 
     pid = resolve_pid(args.pid) if getattr(args, "pid", None) else os.getpid()
     sysproc = dev.find_system_eprocess()
     if not sysproc:
         raise WinNotifyError(
-            "could not get the System EPROCESS. Both 0x222010 and the "
-            "PsInitialSystemProcess read failed, which means the driver did "
-            "not accept either request; nothing was probed, so the machine "
-            "is fine")
+            "could not get the System EPROCESS: 0x222010 did not answer and "
+            "the PsInitialSystemProcess fallback was unavailable. Nothing was "
+            "probed, so the machine is fine. Run `info` to see what the "
+            "driver answered for each request")
     eproc = dev.find_process_eprocess(pid)
     if not eproc:
         raise WinNotifyError(
@@ -268,8 +274,12 @@ def cmd_info(dev, args):
     print(f"[+] py           : {sys.version.split()[0]} "
           f"({8 * ctypes.sizeof(ctypes.c_void_p)}-bit)")
     base = dev.kernel_base
-    print(f"[+] ntoskrnl     : 0x{base:X} "
-          f"({getattr(dev, 'kernel_base_source', 'IOCTL')})")
+    if base:
+        print(f"[+] ntoskrnl     : 0x{base:X} "
+              f"({getattr(dev, 'kernel_base_source', 'IOCTL')})")
+    else:
+        print(f"[+] ntoskrnl     : (unavailable: "
+              f"{getattr(dev, 'kernel_base_error', 'not needed')})")
 
     print("[+] driver-discovered addresses (no guessing):")
     sysproc = dev.find_system_eprocess()

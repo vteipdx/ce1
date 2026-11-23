@@ -190,7 +190,28 @@ System EP  0x222010 → 驱动自己 PsLookupProcessByProcessId(4)
 `0x222040` 只在读 EPROCESS 字段时使用,并且有两条硬约束:
 窗口 `[addr-0x10, addr+0x18]` 不能跨页;地址必须是规范内核地址。
 
+> **注意:`ntoskrnl` 的基址不保证 2MB 对齐。** 实测这台机器是
+> `0xFFFFF80461E13000`(4KB 对齐)。任何"必须 2MB 对齐"的校验都会把它误判为
+> 布局错误 —— 旧版本正是因为这条把唯一正确的答案扔掉了。
+
 ## 3.2 修改记录
+
+* **v9 (2026-11-23)**: **`ntoskrnl` 不是 2MB 对齐的 —— 我的校验把它判死了**。
+  你贴的日志里 `module list gave 0xFFFFF80461E13000` 是个**正确答案**:
+  合法内核地址、名字精确匹配 `\ntoskrnl.exe`、低 12 位为 0(4KB 对齐)。
+  但我旧代码要求 `(base & 0x1FFFFF) == 0`,于是把它当成"布局错"扔掉,
+  又退回那个坏掉的 `0x22200C`。现在改成按**自洽性**验证:
+  * 在规范内核区间(`>= 0xFFFF800000000000`)且页对齐;
+  * `ImageSize` 在合理区间;
+  * 路径以请求的模块名结尾。
+  * 顺带把 `_system_module_information()` 的返回值加上 `ImageSize`,
+    并让 `kernel_base_from_system_info()` 失败时**抛异常带原因**
+    (以前是静默返回垃圾 -> 静默 fallback -> 你只看到下游那个 `0x22200C` 报错)。
+* **v9 的另一半:内核基址不再必需**。`0x222010` 直接给 System EPROCESS,
+  `0x222000/0x222004` 只吃 PID,所以整条 read/write 链**不依赖任何内核地址**。
+  `start()` 拿不到基址时只打印一行提示继续跑,不再中止;
+  `find_system_eprocess()` 的 `PsInitialSystemProcess` 回退在无基址时直接跳过
+  (否则会拿 `kernel_base + offset` = 用户态地址去给驱动解引用 —— 这是个真 bug)。
 
 * **v8 (2026-11-23)**: **按 `signed.sys` 本体反汇编重写 IOCTL 层**。
   拿你给的那个仓库里的 `signed.sys`(sha256 `4dc3a03a…508e0f`)
