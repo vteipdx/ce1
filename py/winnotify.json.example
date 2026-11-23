@@ -1,5 +1,5 @@
 {
-  "_comment": "copy to winnotify.json next to the exe. 0x-strings become ints. Win10 21H2 (19044) uses preferred_ps_offset 0xCFC420.",
+  "_comment": "copy to winnotify.json next to the exe. 0x-strings become ints. Win10 21H2 (19044): preferred_ps_offset 0xCFC420. Never set info_name_is_pointer=false: the driver dereferences +0x00.",
   "ioctl_info": "0x22200C",
   "ioctl_read": "0x222040",
   "ioctl_write": "0x222044",
@@ -77,5 +77,7 @@
   "probe_ps_offsets": false,
   "preferred_ps_offset": "0xCFC420",
   "probe_eprocess_shifts": false,
-  "allow_unknown_ioctl": true
+  "allow_unknown_ioctl": true,
+  "info_name_is_pointer": true,
+  "vet_ioctl_packets": true
 }
