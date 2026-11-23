@@ -1,10 +1,10 @@
 {
-  "_comment": "copy to winnotify.json next to the exe to override. strings may use 0x notation.",
+  "_comment": "copy to winnotify.json next to the exe to override. 0x-strings are converted to int.",
   "ioctl_info": "0x22200C",
   "ioctl_read": "0x222040",
   "ioctl_write": "0x222044",
-  "ioctl_phys_read": "0x222050",
-  "ioctl_phys_write": "0x222054",
+  "ioctl_vread": "0x222000",
+  "ioctl_vwrite": "0x222004",
   "device_path": "\\\\.\\WinNotify",
   "service_name": "WinNotify",
   "driver_search": [
@@ -13,21 +13,63 @@
     "exe_dir\\signeddrv.sys",
     "C:\\Windows\\System32\\drivers\\signeddrv.sys"
   ],
-  "info_module_names": ["ntoskrnl.exe", "ntoskrnl"],
-  "info_input_size": 256,
-  "info_output_size": 64,
+  "info_module_names": [
+    "ntoskrnl.exe",
+    "ntoskrnl"
+  ],
+  "info_in_size": "0x18",
+  "info_out_size": "0x20",
   "info_result_offset": "0x10",
-  "read_input_size": 56,
+  "read_in_size": "0x38",
+  "read_out_size": "0x40",
   "read_bias": "0x10",
-  "read_output_size": 64,
   "read_result_offset": "0x20",
-  "write_input_size": 24,
-  "phys_header_size": 20,
+  "read_qwords": 5,
+  "write_in_size": "0x18",
+  "write_out_size": 0,
+  "vioctl_size": "0x28",
+  "vioctl_layout": 0,
+  "vioctl_probe_sizes": [
+    "0x28",
+    "0x20"
+  ],
+  "info_probe_sizes": [
+    "0x18",
+    "0x28"
+  ],
+  "info_probe_out_sizes": [
+    "0x20",
+    "0x40"
+  ],
+  "read_probe_sizes": [
+    "0x38",
+    "0x40"
+  ],
+  "read_probe_biases": [
+    "0x10",
+    0
+  ],
+  "write_probe_sizes": [
+    "0x18",
+    "0x28"
+  ],
+  "autodetect": true,
+  "use_direct_vioctl": true,
   "phys_page_size": "0x1000",
   "eprocess_links": "0x448",
   "eprocess_pid": "0x440",
   "eprocess_dtb": "0x28",
-  "ps_initial_system_offsets": ["0xCFC420", "0xD19420", "0xD0A420", "0xCFC3E0"],
+  "eprocess_probe_shifts": [
+    "0x10",
+    0
+  ],
+  "ps_initial_system_offsets": [
+    "0xD8C420",
+    "0xCFC420",
+    "0xD19420",
+    "0xD0A420",
+    "0xCFC3E0"
+  ],
   "cr3_mask": "0x000FFFFFFFFFF000",
   "keep_service": true
 }
