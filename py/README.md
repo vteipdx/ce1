@@ -154,7 +154,7 @@ dev.stop()
 | `0x22200C` 取模块基址 | `0x18` | `[+0] 指向 "ntoskrnl.exe" 的**用户指针**(不是字节!)` | `+0x10 = base` |
 | `0x222040` 内核读 | `0x38` | `[+0] base`, `[+8] offset` | `+0x10..0x30` 共 5 个 QWORD,仅当 `*(base+offset+0x10)!=0` 才回写 |
 | `0x222044` 内核写 | `0x18` | `[+0] src`, `[+8] size`, `[+0x10] dst` | `memmove(dst, src, size)` |
-| `0x222000` 虚拟读 | `0x28` | `[+0] **PID**`, `[+8] va`, `[+0x10] buf`, `[+0x18] size`, `[+0x20] 必须非 0` | 数据写进 `buf` |
+| `0x222000` 虚拟读 | `0x28` | `[+0] **PID**`, `[+8] va`, `[+0x10] buf`, `[+0x18] size`, `[+0x20] **DirBase**` | 数据写进 `buf` |
 | `0x222004` 虚拟写 | `0x28` | 同上 | 从 `buf` 写进目标进程 |
 | `0x222010` 取 System EPROCESS | `8` | 无 | `+0x00` = SYSTEM 进程的 EPROCESS |
 | `0x222014` 取进程映象基址 | `0x18` | `[+0] pid`, `[+0x10] size≠0` | `+0x08` = 该进程的映像基址 |
@@ -195,6 +195,27 @@ System EP  0x222010 → 驱动自己 PsLookupProcessByProcessId(4)
 > 布局错误 —— 旧版本正是因为这条把唯一正确的答案扔掉了。
 
 ## 3.2 修改记录
+
+* **v10 (2026-11-23)**: **`in[0x20]` 是 CR3,不是哨兵位**。
+  反汇编 `sub_2a24`:
+  ```asm
+  140002a60: cmp  qword ptr [rcx+0x20], 0
+  140002a65: je   -> 0xC0000022          ; 只检查非 0
+  140002a7a: mov  rdx, qword ptr [rdi+0x20]  ; 然后拿它当 DirBase
+  140002a81: call 0x140002c10                ; 去翻页表 PML4->PDPT->PD->PT
+  ```
+  我之前把它读成"必须非 0 的哨兵",塞了常量 `1`。驱动于是拿物理地址 0
+  翻页表,每条请求返回 **`STATUS_ACCESS_DENIED`(你看到的 WinError 5)**。
+  现在 `_vioclt_packet()` 必须带真实 DirBase:从 `EPROCESS+0x28` 取,
+  并且 `_vet_ioctl_packet()` 会拦下任何不像页表基址的值。
+  因此 `read_memory`/`write_memory` 现在两条路径都要 CR3(以前只有回退路径查)。
+* **v10 附带**:`_RTL_PROCESS_MODULE_INFORMATION.ImageSize` 是
+  **`+0x18` 处的 DWORD**,不是 8 字节(`+0x1C` 是 `Flags`)。
+  你日志里 `ImageSize 0x0880408001046000` 就是两个 DWORD 拼在一起:
+  真值是 `0x01046000`(16 MB,合理),`Flags = 0x08804080`。
+  修正后模块列表这条路也不再误报。
+  另外**没有**去校验 `Flags` 的位 —— 驱动只读 `+0x26` 和 `+0x10`,
+  二进制里验证不出来的东西不该写成断言(2MB 对齐就是这么错的)。
 
 * **v9 (2026-11-23)**: **`ntoskrnl` 不是 2MB 对齐的 —— 我的校验把它判死了**。
   你贴的日志里 `module list gave 0xFFFFF80461E13000` 是个**正确答案**:

