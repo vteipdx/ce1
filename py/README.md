@@ -16,6 +16,21 @@ py/
   requirements-build.txt  打包依赖
 ```
 
+> ⚠️ **会蓝屏的风险点(已处理,请先读这一节)**
+> 这个驱动对传入的地址**不做任何校验**,错一个地址 = 立刻 `BUGCHECK`。
+> 旧版本会「挨个试偏移」并把结果直接交给驱动,这就是上次蓝屏的来源。
+> 现在:
+> * 只向驱动发送**规范内核地址**(`>= 0xFFFF800000000000`),用户态/非规范地址一律在本地拦下;
+> * 进程读写只走 `0x222000/0x222004`(驱动自己翻页表、失败返回状态码,**不会**蓝屏);
+> * 内核读到的每个候选都先做**结构校验**(Flink/Blink 是内核指针、DTB 像 CR3、PID 合理),不合法就直接放弃;
+> * 猜测默认**关闭**:`ps_initial_system_offsets` 只用第一个,`probe_ps_offsets` 默认 false;
+> * `selftest` 不再猜任何内核地址(只用 image base / PEB / 新分配内存,全在用户态取得);
+> * `read`/`write` 遇到 `0x0`、`<0x10000`、内核地址、跨出用户空间的长度,直接拒绝。
+>
+> 第一次在 Win10 21H2(19044) 上建议按下面顺序跑:
+> `selftest` → `memory-test` → `info` → 再动游戏。
+> 调 `info` 时用 `--max-offsets 1` 只测一个候选,最保险。
+
 ## 1. 打包成 exe
 
 Windows 上(管理员 PowerShell):
@@ -60,8 +75,11 @@ winnotify-cli.exe freeze PlantsVsZombies.exe 0x0019A5B8 999 -i 0.1
 :: 自检: 驱动加载 -> ntoskrnl base -> EPROCESS 遍历 -> CR3 页表读写
 winnotify-cli.exe selftest
 
-:: 排障: 系统版本 + 每个 PsInitialSystemProcess 候选偏移命中情况
-winnotify-cli.exe info
+:: 安全的自读自写测试(只动自己进程的 4 KB 新内存,不会蓝屏)
+winnotify-cli.exe memory-test
+
+:: 排障: 系统版本 + PsInitialSystemProcess 候选偏移命中情况(只读)
+winnotify-cli.exe info --max-offsets 1
 ```
 
 * `<proc>` 可以写 PID(`1234` / `0x4D2`)或进程名(`PlantsVsZombies.exe`)。
@@ -104,6 +122,10 @@ dev.stop()
 | `read_bias/read_result_offset` | READ IOCTL 的“地址-0x10”怪癖 | `0x10/0x20` |
 | `info_result_offset` | INFO IOCTL 返回内核基址的位置 | `0x10` |
 | `keep_service` | 退出时是否保留驱动服务 | `true` |
+| `preferred_ps_offset` | 你机子的 `PsInitialSystemProcess` 偏移(优先使用) | `0xCFC420` |
+| `probe_ps_offsets` | 是否依次尝试其它候选(会多解引用,默认关) | `false` |
+| `probe_eprocess_shifts` | 是否尝试 pid/links `+0x10`(Win11 24H2) | `false` |
+| `vioctl_chunk` | 单次虚拟读写字节数(越小越温和) | `0x1000` |
 
 `selftest` 会逐段报告哪一步失败,对应改哪个字段。
 
@@ -136,6 +158,15 @@ dev.stop()
 
 ## 3.2 修改记录
 
+* **v4 (2026-11-23)**: **修复蓝屏**。
+  * 所有发往驱动的内核地址强制走规范化/内核区间检查(`_gate_kernel_addr`);
+  * `read_memory`/`write_memory` 增加用户态地址守卫(0 页、`<0x10000`、内核地址、跨界);
+  * EPROCESS 候选先结构校验(`_looks_like_eprocess`)再使用;
+  * 偏移探测默认关闭(`probe_ps_offsets` / `probe_eprocess_shifts`),只认配置里第一个;
+    Win10 21H2(19044) 的 `0xCFC420` 已放到默认第一位;
+  * `use_direct_vioctl` 为 true 时非法页由驱动返回状态码,不再由用户态解析页表;
+  * `selftest` 改为完全不猜内核地址,新增 `memory-test`、`info --max-offsets`;
+  * 新增回归:任何不安全地址在到达驱动前就被拒绝(见 README 第 5 节)。
 * **v3 (2026-11-23)**: 按真实驱动 ABI 重写 IOCTL 层(见 3.1),修复 `WinError 24`;
   新增 `0x222000/0x222004` 直读直写;长度/布局自动探测;EPROCESS 支持
   Win11 24H2+ 的 `+0x10` 位移;新增 `winnotify-cli.exe info`。
@@ -147,7 +178,45 @@ dev.stop()
   运行时任何异常都打印成一行中文友好的 `[ERROR]`,不再抛 traceback。
 * 输出全部改为 ASCII,避免 cp936 控制台乱码/编码异常。
 
-## 4. 说明 / 边界
+## 4. 安全模型:为什么不会再蓝屏
+
+| 场景 | 旧行为 | 现在 |
+|---|---|---|
+| `0x222040` 收到用户态/非规范地址 | 驱动直接解引用 -> BSOD | 本地拒绝,IOCTL 根本不发 |
+| `PsInitialSystemProcess` 偏移不对 | 把垃圾当指针继续读 | 结构校验不过 -> 停下,不崩 |
+| 读进程里未映射的页 | 用户态自己猜物理地址再读 | `0x222000` 由驱动返回状态码 |
+| `read`/`write` 传 `0x0` / 内核地址 | 直接下发 | 本地拒绝 |
+| 猜 EPROCESS `+0x10` 位移 | 自动尝试 | 默认关闭,`probe_eprocess_shifts` 才开 |
+
+```
+PS> winnotify-cli.exe selftest
+[1/5] driver       : E:\...\signeddrv.sys
+[2/5] ntoskrnl      : 0xFFFFF800...   (KASLR defeated, no address guessed)
+[3/5] EPROCESS/CR3  : 0x1AD000   (pid 1234, this process)
+[4/5] page-table R/W: read b'MZ' at 0x7FF6... (image base (MZ)) -- OK
+[5/5] write test   : wrote+verified b'WINNOTIFY-SELFTEST' at 0x...
+[OK] all safe checks passed -- driver, kernel base, EPROCESS walk and page-table R/W work
+```
+
+仍然有残余风险的只有一处:`info --max-offsets N`(N>1)会为每个候选解引用一次
+去读 PID。默认只测 1 个;把已知偏移写进 `preferred_ps_offset` 后可以完全不猜。
+
+### Win10 21H2(19044) 的偏移
+
+`19041/19042/19043/19044/19045` 是同一套 EPROCESS 布局:
+
+| 字段 | 偏移 |
+|---|---|
+| `DirectoryTableBase` | `0x28` |
+| `UniqueProcessId` | `0x440` |
+| `ActiveProcessLinks` | `0x448` |
+| `PsInitialSystemProcess`(相对 ntoskrnl) | `0xCFC420` |
+
+如果 `selftest` 停在 `[3/5]`,把 `winnotify.json` 里
+`"preferred_ps_offset"` 写成你机子上 `PsInitialSystemProcess` 的真实偏移
+(用 `info --max-offsets 1` 或 Windbg 的 `x nt!PsInitialSystemProcess` 确认)。
+
+## 5. 说明 / 边界
 
 * 这是 `src/PhysicalMemory.pas` 的**纯 Python 移植**,不是新驱动:驱动验证、加载方式
   仍由 WinNotify.sys 自己决定;工具只负责 `CreateService + StartService + DeviceIoControl`。

@@ -10,6 +10,7 @@ Explicit sub-commands:
     winnotify-cli.exe freeze <proc> <addr> <value> [-i 0.1]
     winnotify-cli.exe selftest [--pid <pid>]
     winnotify-cli.exe info                     show driver/OS/offset diagnostics
+    winnotify-cli.exe memory-test              safe read/write test on our own process
 
 <proc>  = PID ("1234", "0x4D2") or image name ("PlantsVsZombies.exe")
 <addr>  = virtual address inside the target, 0x... or decimal
@@ -130,74 +131,120 @@ def cmd_freeze(dev, args):
 
 
 def cmd_selftest(dev, args):
-    """Walk the chain step by step and say exactly which link is broken."""
-    print(f"[1/5] driver     : {dev.driver_path or '(already loaded)'}")
-    print(f"      device     : {dev.cfg['device_path']}")
-    print(f"      service    : {dev.service_name}")
+    """Non-destructive checks only -- nothing here can bugcheck the machine.
 
-    try:
-        base = dev.get_kernel_base()
-    except WinNotifyError as exc:
-        raise WinNotifyError(f"module-base IOCTL failed: {exc}")
-    print(f"[2/5] ntoskrnl    : 0x{base:X}   (KASLR defeated)")
+    Deliberately does NOT walk kernel structures: with this driver every
+    unvalidated address dereference is a potential BSOD, so the risky part is
+    split into `memory-test` (own process only) and the offset hunt in `info`.
+    """
+    print(f"[1/5] driver       : {dev.driver_path or '(already loaded)'}")
+    print(f"      device       : {dev.cfg['device_path']}")
+    print(f"      service      : {dev.service_name}")
 
-    eproc = dev.find_system_eprocess()
-    if not eproc:
-        raise WinNotifyError(
-            "System EPROCESS not found: none of ps_initial_system_offsets "
-            f"{[hex(v) for v in dev.cfg['ps_initial_system_offsets']]} resolved. "
-            "Run `winnotify-cli.exe info` to see your build number and set the "
-            "matching offset in winnotify.json")
-    print(f"[3/5] EPROCESS    : 0x{eproc:X}   (System, PID 4)")
+    base = dev.get_kernel_base()          # 0x22200C, no address dereference
+    print(f"[2/5] ntoskrnl      : 0x{base:X}   (KASLR defeated, no address guessed)")
 
-    if args.pid:
-        pid = resolve_pid(args.pid)
-    else:
-        pid = os.getpid()          # testing ourselves is always available
-    cr3 = dev.get_process_cr3(pid)
+    pid = resolve_pid(args.pid) if args.pid else os.getpid()
+    cr3 = dev.get_process_cr3(pid)        # validated EPROCESS walk
     if not cr3:
         raise WinNotifyError(
-            f"EPROCESS for pid {pid} not found in ActiveProcessLinks -- "
-            "offsets eprocess_pid/eprocess_links probably do not match this build")
-    print(f"[4/5] CR3         : 0x{cr3:X}   (pid {pid}"
+            f"could not resolve CR3 for pid {pid}.  Nothing was probed, so the "
+            "machine is fine. Run `winnotify-cli.exe info` to see which "
+            "PsInitialSystemProcess offset matches your build, then put it "
+            "first in ps_initial_system_offsets")
+    print(f"[3/5] EPROCESS/CR3  : 0x{cr3:X}   (pid {pid}"
           + (", this process)" if pid == os.getpid() else ")"))
 
-    module_base = winnotify._host_dll()
-    try:
-        head = dev.read_memory(pid, module_base, 2)
-    except WinNotifyError as exc:
+    # 4) safe *user-mode* address discovery + page-table read of it
+    addresses = winnotify.self_addresses()
+    if not addresses:
+        raise WinNotifyError("could not determine any known-good user address")
+    label, addr = addresses[0]
+    head = dev.read_memory(pid, addr, 2)
+    print(f"[4/5] page-table R/W: read {head!r} at 0x{addr:X} ({label}) -- OK")
+    if pid == os.getpid() and addr == winnotify.module_base_w(None) and head != b"MZ":
         raise WinNotifyError(
-            f"page-table read failed: {exc}  -- if the virtual-RW IOCTL layout "
-            "does not match this driver build, set \"use_direct_vioctl\": false "
-            "in winnotify.json to fall back to 0x222040/0x222044")
-    if head != b"MZ":
-        raise WinNotifyError(
-            f"page-table read returned {head!r} instead of b'MZ' -- if the "
-            "virtual-RW IOCTL layout is wrong set use_direct_vioctl=false in "
-            "winnotify.json to use the 0x222040/0x222044 fallback")
-    print(f"[5/5] memory R/W  : read MZ header at 0x{module_base:X} through CR3 -- OK")
-    print("[OK] WinNotify bridge fully operational "
-          "(driver, kernel R/W, EPROCESS walk, process R/W)")
+            "self image base did not read back as MZ -- page-table IOCTL layout "
+            "is wrong for this driver build")
+
+    # 5) write-back test on memory we own (only for ourselves)
+    if pid == os.getpid():
+        marker = b"WINNOTIFY-SELFTEST"
+        target = None
+        for label, candidate in addresses:
+            if label.startswith("fresh"):
+                target = candidate
+        if target:
+            dev.write_memory(pid, target, marker)
+            back = dev.read_memory(pid, target, len(marker))
+            if back != marker:
+                raise WinNotifyError(f"write test mismatch: wrote {marker!r}, got {back!r}")
+            print(f"[5/5] write test   : wrote+verified {marker!r} at 0x{target:X}")
+        else:
+            print("[5/5] write test   : skipped (no scratch allocation)")
+    else:
+        print("[5/5] write test   : skipped (target is not this process; "
+              "use `memory-test` to exercise writes safely)")
+    print("[OK] all safe checks passed -- driver, kernel base, EPROCESS walk and "
+          "page-table R/W work")
+
+
+def cmd_memory_test(dev, args):
+    """Read/write a few bytes inside OUR OWN process -- cannot bugcheck."""
+    pid = os.getpid()
+    print(f"[*] target: own process, pid {pid} (a bad address here kills only this tool)")
+    cr3 = dev.get_process_cr3(pid)
+    if not cr3:
+        raise WinNotifyError("own CR3 not resolved -- run `info` first")
+    addresses = winnotify.self_addresses()
+    for label, addr in addresses:
+        try:
+            head = dev.read_memory(pid, addr, 8)
+            print(f"[+] read  0x{addr:X} {label:24s} -> {head.hex()}")
+        except WinNotifyError as exc:
+            print(f"[!] read  0x{addr:X} {label:24s} -> {exc}")
+    scratch = [a for l, a in addresses if l.startswith("fresh")]
+    if scratch:
+        marker = b"WINNOTIFY-OK"
+        dev.write_memory(pid, scratch[0], marker)
+        back = dev.read_memory(pid, scratch[0], len(marker))
+        print(f"[+] write 0x{scratch[0]:X} -> {back!r} "
+              + ("OK" if back == marker else "MISMATCH"))
+    print("[OK] own-process page-table access verified")
 
 
 def cmd_info(dev, args):
-    """Show what this build/driver actually is (helps pick offsets)."""
+    """Show what this build/driver is; never dereferences anything unvalidated."""
     print(f"[+] driver       : {dev.driver_path or '(already loaded)'}")
     print(f"[+] device       : {dev.cfg['device_path']}")
     print(f"[+] os           : {platform.platform()}")
     if winnotify.IS_WINDOWS:
         print(f"[+] build        : {platform.version()}")
-    print(f"[+] py           : {sys.version.split()[0]} ({8 * ctypes.sizeof(ctypes.c_void_p)}-bit)")
+    print(f"[+] py           : {sys.version.split()[0]} "
+          f"({8 * ctypes.sizeof(ctypes.c_void_p)}-bit)")
     base = dev.kernel_base
     print(f"[+] ntoskrnl     : 0x{base:X}")
-    for off in dev.cfg["ps_initial_system_offsets"]:
-        ptr = dev.read_qword(base + off)
-        ok = ""
-        if ptr >> 48 == 0xFFFF:
-            pid = dev.read_qword(ptr + dev.cfg["eprocess_pid"])
-            ok = f" -> EPROCESS 0x{ptr:X} pid={pid}" + ("  <== matches" if pid == 4 else "")
-        print(f"      PsInitialSystemProcess +0x{off:06X}: 0x{ptr:X}{ok}")
-    print(f"[+] layouts tried: {[(hex(a), hex(b), hex(c)) for a, b, c in dev._eprocess_layouts()]}")
+    offsets = dev.cfg["ps_initial_system_offsets"]
+    preferred = dev.cfg.get("preferred_ps_offset")
+    if preferred is not None:
+        offsets = [preferred] + [o for o in offsets if o != preferred]
+    print(f"[+] probing PsInitialSystemProcess candidates "
+          f"(read-only, structural checks, no writes):")
+    for off in offsets[: args.max_offsets]:
+        try:
+            ptr = dev.read_qword(base + off)
+        except WinNotifyError as exc:
+            print(f"      +0x{off:06X}: read failed: {exc}")
+            continue
+        if not dev._is_kernel_ptr(ptr):
+            print(f"      +0x{off:06X}: 0x{ptr:X}   (not a kernel pointer)")
+            continue
+        pid = dev.read_qword(ptr + dev.cfg["eprocess_pid"])
+        sys_ok = pid == 4 and dev._looks_like_eprocess(ptr, dev.cfg["eprocess_pid"])
+        print(f"      +0x{off:06X}: -> 0x{ptr:X} pid={pid}"
+              + ("   <== matches (System)" if sys_ok else ""))
+    print("[i] set preferred_ps_offset (or reorder ps_initial_system_offsets) "
+          "in winnotify.json to the matching value")
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +297,14 @@ def build_parser():
     sp.set_defaults(func=cmd_selftest)
 
     sp = sub.add_parser("info", parents=[common],
-                        help="driver/OS info + which EPROCESS offsets resolve")
+                        help="driver/OS info + which PsInitialSystemProcess offset matches")
+    sp.add_argument("--max-offsets", type=int, default=6,
+                    help="how many candidate offsets to try (default 6)")
     sp.set_defaults(func=cmd_info)
+
+    sp = sub.add_parser("memory-test", parents=[common],
+                        help="safe read/write test inside our own process")
+    sp.set_defaults(func=cmd_memory_test)
 
     return parser
 
@@ -262,7 +315,8 @@ def main(argv=None):
 
     # `exe <proc> <addr> <value>` -> `exe write <proc> <addr> <value>`
     if argv and argv[0] not in ("read", "write", "freeze", "selftest", "info",
-                                "-h", "--help") and not argv[0].startswith("-"):
+                                "memory-test", "-h", "--help") \
+            and not argv[0].startswith("-"):
         if len(argv) >= 3:
             argv = ["write"] + argv
 

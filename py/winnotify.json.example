@@ -1,5 +1,5 @@
 {
-  "_comment": "copy to winnotify.json next to the exe to override. 0x-strings are converted to int.",
+  "_comment": "copy to winnotify.json next to the exe. 0x-strings become ints. Win10 21H2 (19044) uses preferred_ps_offset 0xCFC420.",
   "ioctl_info": "0x22200C",
   "ioctl_read": "0x222040",
   "ioctl_write": "0x222044",
@@ -64,12 +64,18 @@
     0
   ],
   "ps_initial_system_offsets": [
-    "0xD8C420",
     "0xCFC420",
-    "0xD19420",
     "0xD0A420",
+    "0xD19420",
+    "0xD8C420",
     "0xCFC3E0"
   ],
   "cr3_mask": "0x000FFFFFFFFFF000",
-  "keep_service": true
+  "keep_service": true,
+  "vioctl_chunk": "0x1000",
+  "max_process_iter": 2000,
+  "probe_ps_offsets": false,
+  "preferred_ps_offset": "0xCFC420",
+  "probe_eprocess_shifts": false,
+  "allow_unknown_ioctl": true
 }
