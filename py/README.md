@@ -75,6 +75,9 @@ winnotify-cli.exe freeze PlantsVsZombies.exe 0x0019A5B8 999 -i 0.1
 :: 自检: 驱动加载 -> ntoskrnl base -> EPROCESS 遍历 -> CR3 页表读写
 winnotify-cli.exe selftest
 
+:: 权限诊断(不发任何 IOCTL,纯用户态)
+winnotify-cli.exe privcheck
+
 :: 安全的自读自写测试(只动自己进程的 4 KB 新内存,不会蓝屏)
 winnotify-cli.exe memory-test
 
@@ -128,6 +131,9 @@ dev.stop()
 | `vioctl_chunk` | 单次虚拟读写字节数(越小越温和) | `0x1000` |
 | `info_name_is_pointer` | `0x22200C` 的 `+0x00` 放用户态指针(**绝对不要关**) | `true` |
 | `vet_ioctl_packets` | 发送前校验每个 IOCTL 里的指针 | `true` |
+| `ensure_debug_privilege` | 调 `0x22200C` 前确保 SeDebugPrivilege 已启用 | `true` |
+| `fallback_kernel_base` | 驱动返回 0 时用 `NtQuerySystemInformation` 取内核基址 | `true` |
+| `force_unload` | 允许 `--unload` 停止刚启动的驱动(可能蓝屏,默认拒绝) | `false` |
 
 `selftest` 会逐段报告哪一步失败,对应改哪个字段。
 
@@ -160,6 +166,14 @@ dev.stop()
 
 ## 3.2 修改记录
 
+* **v6 (2026-11-23)**: **修复 `0x22200C` 返回 0**。
+  驱动内部走 `ZwQuerySystemInformation(SystemModuleInformation)`(信息类 0xb),
+  这个类只有在调用方令牌的 **SeDebugPrivilege 处于启用状态**时才会返回模块列表,
+  否则列表为空 -> 驱动返回 0。管理员默认"持有但禁用"该权限,所以必须主动启用。
+  现在启动时会自动 `AdjustTokenPrivileges` 打开 SeDebugPrivilege;
+  若仍然拿不到,则用用户态 `NtQuerySystemInformation` 自己解析
+  `_RTL_PROCESS_MODULE_INFORMATION`(0x130 字节,`ImageBase` 在 +0x00,
+  `FullDllName` 在 +0x28)作为回退。另新增 `privcheck`(不发任何 IOCTL)。
 * **v5 (2026-11-23)**: **修复 `selftest` 蓝屏的真正原因**。
   `0x22200C` 的 `+0x00` 不是一个字符串,而是**指向模块名字符串的用户态指针**;
   旧代码把 `"ntoskrnl.exe"` 的字节写在 `+0x00`,驱动于是把
@@ -197,6 +211,7 @@ dev.stop()
 | 读进程里未映射的页 | 用户态自己猜物理地址再读 | `0x222000` 由驱动返回状态码 |
 | `read`/`write` 传 `0x0` / 内核地址 | 直接下发 | 本地拒绝 |
 | `0x22200C` 的 `+0x00` 写成字符串字节 | 驱动把 ASCII 当地址 -> BSOD | 自动放用户态指针,且发送前校验 |
+| `SeDebugPrivilege` 未启用 | `0x22200C` 静默返回 0 | 自动启用;失败则用 `NtQuerySystemInformation` 回退 |
 | 任何 IOCTL 里出现非法指针 | 驱动直接解引用 | `_vet_ioctl_packet` 本地拦截 |
 | 猜 EPROCESS `+0x10` 位移 | 自动尝试 | 默认关闭,`probe_eprocess_shifts` 才开 |
 

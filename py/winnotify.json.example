@@ -79,5 +79,8 @@
   "probe_eprocess_shifts": false,
   "allow_unknown_ioctl": true,
   "info_name_is_pointer": true,
-  "vet_ioctl_packets": true
+  "vet_ioctl_packets": true,
+  "ensure_debug_privilege": true,
+  "fallback_kernel_base": true,
+  "force_unload": false
 }

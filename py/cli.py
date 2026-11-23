@@ -11,6 +11,7 @@ Explicit sub-commands:
     winnotify-cli.exe selftest [--pid <pid>]
     winnotify-cli.exe info                     show driver/OS/offset diagnostics
     winnotify-cli.exe memory-test              safe read/write test on our own process
+    winnotify-cli.exe privcheck                token/privilege diagnostics (no IOCTL)
 
 <proc>  = PID ("1234", "0x4D2") or image name ("PlantsVsZombies.exe")
 <addr>  = virtual address inside the target, 0x... or decimal
@@ -18,6 +19,7 @@ value   = int by default; use -t float for floats, -t bytes for "DEADBEEF"
 """
 import argparse
 import ctypes
+from ctypes import wintypes
 import os
 import platform
 import struct
@@ -141,7 +143,19 @@ def cmd_selftest(dev, args):
     print(f"      device       : {dev.cfg['device_path']}")
     print(f"      service      : {dev.service_name}")
 
-    base = dev.get_kernel_base()          # 0x22200C, no address dereference
+    try:
+        base = dev.get_kernel_base()      # 0x22200C, no address dereference
+    except WinNotifyError as exc:
+        print(f"[2/5] module-base IOCTL failed: {exc}")
+        try:
+            present, enabled = winnotify.privilege_state("SeDebugPrivilege")
+            print(f"      SeDebugPrivilege: present={present} enabled={enabled}")
+            if present and not enabled:
+                print("      -> internal ZwQuerySystemInformation returns an "
+                      "empty list; run `privcheck` or restart elevated")
+        except WinNotifyError:
+            pass
+        raise
     print(f"[2/5] ntoskrnl      : 0x{base:X}   (KASLR defeated, no address guessed)")
 
     pid = resolve_pid(args.pid) if args.pid else os.getpid()
@@ -211,6 +225,45 @@ def cmd_memory_test(dev, args):
         print(f"[+] write 0x{scratch[0]:X} -> {back!r} "
               + ("OK" if back == marker else "MISMATCH"))
     print("[OK] own-process page-table access verified")
+
+
+def cmd_privcheck(dev, args):
+    """Pure Win32 diagnostics: no IOCTL is sent, nothing can crash.
+
+    The module-base IOCTL runs ZwQuerySystemInformation(SystemModuleInformation)
+    inside the driver, which only returns data when the caller's token has
+    SeDebugPrivilege ENABLED.  This shows the token state up front.
+    """
+    print("[i] no IOCTL is sent by this command -- it only inspects the token")
+    elevated = _is_admin()
+    print(f"[+] running as admin : {elevated}")
+    if not elevated:
+        print("[!] not elevated -- SeDebugPrivilege/SeLoadDriverPrivilege are "
+              "usually unavailable; re-run from an Administrator prompt")
+    for name in ("SeDebugPrivilege", "SeLoadDriverPrivilege"):
+        try:
+            present, enabled = winnotify.privilege_state(name)
+        except WinNotifyError as exc:
+            print(f"[-] {name}: {exc}")
+            continue
+        print(f"[+] {name:22s} present={present!s:5s} enabled={enabled}")
+        if present and not enabled:
+            try:
+                enable_privilege(name)
+                present, enabled = winnotify.privilege_state(name)
+                print(f"    -> enabled now: {enabled}")
+            except WinNotifyError as exc:
+                print(f"    -> could not enable: {exc}")
+    print("[i] 0x22200C answers 0 if SeDebugPrivilege is not enabled at call time")
+
+
+def _is_admin():
+    try:
+        shell32 = ctypes.WinDLL("shell32")
+        shell32.IsUserAnAdmin.restype = wintypes.BOOL
+        return bool(shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def cmd_info(dev, args):
@@ -296,6 +349,10 @@ def build_parser():
     sp.add_argument("--pid", default=None)
     sp.set_defaults(func=cmd_selftest)
 
+    sp = sub.add_parser("privcheck", parents=[common],
+                        help="token/privilege diagnostics (sends no IOCTL)")
+    sp.set_defaults(func=cmd_privcheck)
+
     sp = sub.add_parser("info", parents=[common],
                         help="driver/OS info + which PsInitialSystemProcess offset matches")
     sp.add_argument("--max-offsets", type=int, default=6,
@@ -315,7 +372,7 @@ def main(argv=None):
 
     # `exe <proc> <addr> <value>` -> `exe write <proc> <addr> <value>`
     if argv and argv[0] not in ("read", "write", "freeze", "selftest", "info",
-                                "memory-test", "-h", "--help") \
+                                "memory-test", "privcheck", "-h", "--help") \
             and not argv[0].startswith("-"):
         if len(argv) >= 3:
             argv = ["write"] + argv
