@@ -82,8 +82,8 @@ winnotify-cli.exe privcheck
 :: 安全的自读自写测试(只动自己进程的 4 KB 新内存,不会蓝屏)
 winnotify-cli.exe memory-test
 
-:: 排障: 系统版本 + PsInitialSystemProcess 候选偏移命中情况(只读)
-winnotify-cli.exe info --max-offsets 1
+:: 排障: 系统版本 + 驱动的地址来源 + EPROCESS 链(只读)
+winnotify-cli.exe info --max-offsets 8
 ```
 
 * `<proc>` 可以写 PID(`1234` / `0x4D2`)或进程名(`PlantsVsZombies.exe`)。
@@ -195,6 +195,24 @@ System EP  0x222010 → 驱动自己 PsLookupProcessByProcessId(4)
 > 布局错误 —— 旧版本正是因为这条把唯一正确的答案扔掉了。
 
 ## 3.2 修改记录
+
+* **✅ v10 已在真机验证通过 (Win10 21H2 / 19044, signed.sys)**
+  ```
+  [+] ntoskrnl base: 0xFFFFF80461E13000 (NtQuerySystemInformation)
+  [i] EPROCESS 0xFFFFD58C84446080: pid +0x440, DirBase 0x4D91E000
+  [3/5] EPROCESS/CR3  : 0x4D91E000   (pid 4000, this process)
+  [4/5] page-table R/W: read b'MZ' at 0x7FF7140E0000 -- OK
+  [5/5] write test   : wrote+verified b'WINNOTIFY-SELFTEST' at 0x21D79760000
+  [OK] all safe checks passed
+  ```
+  五段全过:**取基址 / 取位 System EPROCESS / 遍历 EPROCESS 拿 CR3 /
+  按 CR3 读用户内存 / 按 CR3 写回并校验**。全程零蓝屏。
+  这一版之前踩过的三个坑(供以后排查参考):
+  1. `_RTL_PROCESS_MODULE_INFORMATION` stride 是 `0x128`、`ImageBase` 在 `+0x10`
+     (`0x130` / `+0x00` 都是错的);
+  2. `ntoskrnl` **不保证 2MB 对齐**,本机是 4KB 对齐的 `0xFFFFF80461E13000`;
+  3. `0x222000/0x222004` 的 `in[0x20]` 是**真正的 DirBase**,驱动拿它翻页表,
+     传常量或 0 只会得到 `STATUS_ACCESS_DENIED`。
 
 * **v10 (2026-11-23)**: **`in[0x20]` 是 CR3,不是哨兵位**。
   反汇编 `sub_2a24`:
